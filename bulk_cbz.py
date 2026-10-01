@@ -181,7 +181,7 @@ def converted_arcname(arcname: str, convert_to: str) -> str:
     return str(PurePosixPath(arcname).with_suffix(CONVERT_TARGETS[convert_to]))
 
 
-def find_imagemagick(explicit: str | None = None) -> str:
+def find_imagemagick(explicit: str | None = None) -> str | None:
     candidates: list[str] = []
     if explicit:
         candidates.append(explicit)
@@ -198,17 +198,12 @@ def find_imagemagick(explicit: str | None = None) -> str:
                 text=True,
                 timeout=10,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            if explicit:
-                raise BulkCbzError(f"cannot run ImageMagick command {command}: {exc}") from exc
+        except (OSError, subprocess.TimeoutExpired):
             continue
         details = f"{proc.stdout}{proc.stderr}"
         if proc.returncode == 0 and "ImageMagick" in details:
             return command
-    raise BulkCbzError(
-        "ImageMagick is required to convert pages that are not JPEG or PNG. "
-        "Install it (for example: apt install imagemagick) or pass --no-convert."
-    )
+    return None
 
 
 def convert_image(path: Path, convert_to: str, magick: str) -> bytes:
@@ -413,7 +408,16 @@ def write_cbz(plan: FolderPlan, options: Options) -> None:
     entries = plan_archive_entries(plan.files, plan.source, options)
     magick = options.imagemagick
     if any(entry.convert for entry in entries):
-        magick = magick or find_imagemagick()
+        magick = magick or find_imagemagick(options.imagemagick)
+        if magick is None:
+            entries = [
+                ArchiveEntry(
+                    source=entry.source,
+                    arcname=arcname_for(entry.source, plan.source),
+                    convert=False,
+                )
+                for entry in entries
+            ]
     tmp_path = plan.output.with_name(plan.output.name + ".partial")
     if tmp_path.exists():
         tmp_path.unlink()
@@ -554,7 +558,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Convert every folder in a directory into a CBZ file named after "
             "that folder. Image pages are added in natural order "
             "(page2 before page10). Pages that are not JPEG or PNG are converted "
-            "to PNG with ImageMagick unless you pass --convert-to or --no-convert."
+            "to PNG with ImageMagick when it is available."
         ),
         epilog="""
 common usages:
@@ -584,7 +588,7 @@ common usages:
       Convert WebP/GIF/etc. to JPEG instead of PNG. JPEG and PNG pages stay as-is.
 
   %(prog)s . --no-convert
-      Pack original page files without running ImageMagick.
+      Pack original page files without converting formats.
 
   %(prog)s . --min-files 10 --exclude '*sample*'
       Skip incomplete chapters and folders whose names match a glob.
@@ -688,7 +692,7 @@ common usages:
     parser.add_argument(
         "--convert-to",
         choices=("png", "jpeg", "jpg", "webp"),
-        help="Format for pages that are not JPEG or PNG (default: png). JPEG and PNG are left as-is",
+        help="Format for pages that are not JPEG or PNG (default: png). JPEG and PNG are left as-is. Skipped with a warning if ImageMagick is not available",
     )
     parser.add_argument(
         "--no-convert",
@@ -767,10 +771,29 @@ def needs_conversion(plans: Sequence[FolderPlan], options: Options) -> bool:
     )
 
 
+def warn_and_skip_conversion(options: Options) -> None:
+    if options.imagemagick:
+        message = (
+            f"warn  ImageMagick command {options.imagemagick} is not available; "
+            "packing original page files without conversion"
+        )
+    else:
+        message = (
+            "warn  ImageMagick not available; "
+            "packing original page files without conversion"
+        )
+    log(message, options, error=True)
+    options.convert_to = None
+
+
 def run(options: Options) -> list[PackResult]:
     plans = plan_conversions(options)
-    if needs_conversion(plans, options) and not options.dry_run:
-        options.imagemagick = find_imagemagick(options.imagemagick)
+    if needs_conversion(plans, options):
+        magick = find_imagemagick(options.imagemagick)
+        if magick:
+            options.imagemagick = magick
+        else:
+            warn_and_skip_conversion(options)
     return [convert_folder(plan, options) for plan in plans]
 
 

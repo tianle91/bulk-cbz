@@ -42,10 +42,10 @@ def png_color_type(data: bytes) -> int:
 
 
 def require_imagemagick() -> str:
-    try:
-        return bulk_cbz.find_imagemagick()
-    except bulk_cbz.BulkCbzError as exc:
-        raise unittest.SkipTest(str(exc)) from exc
+    found = bulk_cbz.find_imagemagick()
+    if not found:
+        raise unittest.SkipTest("ImageMagick is not available")
+    return found
 
 
 def write_im_image(path: Path, im_format: str, *, transparent: bool = False) -> Path:
@@ -299,7 +299,7 @@ class BulkCbzTests(unittest.TestCase):
             converted = zip_bytes(root / "Ch.cbz", "page.jpg")
             self.assertTrue(converted.startswith(JPEG_SOI))
 
-    def test_dry_run_reports_conversion_without_imagemagick(self) -> None:
+    def test_dry_run_skips_conversion_when_imagemagick_missing(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
             folder = root / "Ch"
@@ -308,19 +308,25 @@ class BulkCbzTests(unittest.TestCase):
             code, stdout, stderr = run_cli(
                 [str(root), "--dry-run", "--verbose", "--imagemagick", "/missing/magick"]
             )
-            self.assertEqual(code, 0, stderr)
+            self.assertEqual(code, 0)
             self.assertFalse((root / "Ch.cbz").exists())
-            self.assertIn("page.webp -> page.png", stdout)
+            self.assertIn("ImageMagick", stderr)
+            self.assertIn("without conversion", stderr)
+            self.assertIn("page.webp", stdout)
+            self.assertNotIn("page.webp -> page.png", stdout)
 
-    def test_missing_imagemagick_fails_when_conversion_is_needed(self) -> None:
+    def test_missing_imagemagick_warns_and_packs_originals(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
-            write_file(root / "Ch" / "page.webp")
+            write_file(root / "Ch" / "page.webp", b"webp-bytes")
             code, _stdout, stderr = run_cli(
                 [str(root), "--imagemagick", "/missing/magick"]
             )
-            self.assertEqual(code, 2)
+            self.assertEqual(code, 0, stderr)
             self.assertIn("ImageMagick", stderr)
+            self.assertIn("without conversion", stderr)
+            self.assertEqual(zip_names(root / "Ch.cbz"), ["page.webp"])
+            self.assertEqual(zip_bytes(root / "Ch.cbz", "page.webp"), b"webp-bytes")
 
 
 if __name__ == "__main__":

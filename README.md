@@ -8,9 +8,10 @@ A CBZ is a ZIP archive of comic pages. Point the script at a parent folder
 (or run it in the current directory) and each child folder becomes
 `FolderName.cbz`.
 
-Requires Python 3.9+ and the standard library. Converting WebP/GIF/TIFF/etc.
-to PNG (the default) also needs [ImageMagick](https://imagemagick.org/)
-(`magick` or `convert`) on your PATH.
+Requires Python 3.9+ and the standard library. If
+[ImageMagick](https://imagemagick.org/) (`magick` or `convert`) is on your PATH,
+pages that are not JPEG or PNG are converted to PNG by default. If it is not
+available, the script warns and packs the original files.
 
 ```bash
 python3 bulk_cbz.py --help
@@ -85,7 +86,7 @@ By default the script:
 
 - Converts **immediate subfolders** of the given directory, not the directory itself
 - Adds image pages (`jpg`, `jpeg`, `png`, `gif`, `webp`, `bmp`, `tif`, `tiff`, `avif`, `jxl`, `heic`) plus `ComicInfo.xml`
-- Leaves JPEG and PNG pages as-is, and converts other page formats to PNG with ImageMagick (alpha is kept; use `--convert-to` or `--no-convert` to change that)
+- Leaves JPEG and PNG pages as-is, and converts other page formats to PNG with ImageMagick when it is available (alpha is kept; use `--convert-to` or `--no-convert` to change that). If ImageMagick is missing, the script warns and packs the originals
 - Sorts pages naturally, so `page2` comes before `page10`
 - Stores files uncompressed (`--compression store`), which is typical for already-compressed images
 - Skips existing CBZ files unless `--overwrite` is set
@@ -121,5 +122,5 @@ By default the script:
 python3 -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs that suite on every pull request across Python 3.9–3.13
-and installs ImageMagick so the conversion tests can run.
+GitHub Actions runs that suite on every pull request across Python 3.9–3.13.
+Conversion tests are skipped when ImageMagick is not installed.
