@@ -300,6 +300,13 @@ class BulkCbzTests(unittest.TestCase):
         self.assertNotIn("--include-nested", stdout)
         self.assertNotIn("--leaves-only", stdout)
 
+    def test_version_matches_changelog(self) -> None:
+        code, stdout, stderr = run_cli(["--version"])
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(bulk_cbz.__version__, stdout)
+        changelog = (ROOT / "CHANGELOG.md").read_text()
+        self.assertIn(f"[{bulk_cbz.__version__}]", changelog)
+
     def test_no_convert_and_convert_to_are_exclusive(self) -> None:
         code, _stdout, stderr = run_cli([".", "--no-convert", "--convert-to", "jpeg"])
         self.assertEqual(code, 2)

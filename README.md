@@ -16,6 +16,7 @@ available, the script warns and packs the original files.
 
 ```bash
 python3 bulk_cbz.py --help
+python3 bulk_cbz.py --version
 ```
 
 ## Common usages
@@ -128,3 +129,7 @@ python3 -m unittest discover -s tests -v
 
 GitHub Actions runs that suite on every pull request across Python 3.9–3.13.
 Conversion tests are skipped when ImageMagick is not installed.
+
+## Version
+
+`bulk_cbz.py --version` prints the current release. Release notes are in [CHANGELOG.md](CHANGELOG.md).
