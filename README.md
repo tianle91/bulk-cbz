@@ -1,5 +1,7 @@
 # bulk-cbz
 
+[![CI](https://github.com/tianle91/bulk-cbz/actions/workflows/ci.yml/badge.svg)](https://github.com/tianle91/bulk-cbz/actions/workflows/ci.yml)
+
 Convert every folder in a directory into a CBZ file with the same name.
 
 A CBZ is a ZIP archive of comic pages. Point the script at a parent folder
@@ -100,3 +102,5 @@ By default the script:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+GitHub Actions runs that suite on every pull request across Python 3.9–3.13.
