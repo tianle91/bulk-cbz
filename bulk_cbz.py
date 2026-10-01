@@ -20,6 +20,7 @@ import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Sequence
@@ -67,10 +68,21 @@ class Timing:
     pack: float = 0.0
     total: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _convert_inflight: int = field(default=0, repr=False, compare=False)
+    _convert_started: float | None = field(default=None, repr=False, compare=False)
 
-    def add_convert(self, seconds: float) -> None:
+    def convert_enter(self) -> None:
         with self._lock:
-            self.convert += seconds
+            if self._convert_inflight == 0:
+                self._convert_started = time.perf_counter()
+            self._convert_inflight += 1
+
+    def convert_exit(self) -> None:
+        with self._lock:
+            self._convert_inflight -= 1
+            if self._convert_inflight == 0 and self._convert_started is not None:
+                self.convert += time.perf_counter() - self._convert_started
+                self._convert_started = None
 
 
 @dataclass
@@ -92,6 +104,7 @@ class Options:
     imagemagick: str | None = None
     jobs: int = 1
     timing: Timing | None = field(default=None, repr=False, compare=False)
+    convert_gate: threading.Semaphore | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -242,25 +255,40 @@ def convert_output_args(convert_to: str, dest: Path | None = None) -> list[str]:
     return ["-quality", "90", sink]
 
 
-def convert_image(path: Path, convert_to: str, magick: str, dest: Path | None = None) -> bytes:
-    cmd = [magick, f"{path.resolve()}[0]", "-auto-orient", *convert_output_args(convert_to, dest)]
+def convert_image(
+    path: Path,
+    convert_to: str,
+    magick: str,
+    dest: Path | None = None,
+    *,
+    gate: threading.Semaphore | None = None,
+    timing: Timing | None = None,
+) -> bytes:
+    if timing is not None:
+        timing.convert_enter()
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=CONVERT_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise BulkCbzError(f"ImageMagick timed out converting {path}") from exc
-    if dest is not None:
-        if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
-            err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
-            raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
-        return b""
-    if proc.returncode != 0 or not proc.stdout:
-        err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
-        raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
-    return proc.stdout
+        with gate if gate is not None else nullcontext():
+            cmd = [magick, f"{path.resolve()}[0]", "-auto-orient", *convert_output_args(convert_to, dest)]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=CONVERT_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise BulkCbzError(f"ImageMagick timed out converting {path}") from exc
+            if dest is not None:
+                if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+                    err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
+                    raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
+                return b""
+            if proc.returncode != 0 or not proc.stdout:
+                err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
+                raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
+            return proc.stdout
+    finally:
+        if timing is not None:
+            timing.convert_exit()
 
 
 def is_packable_file(path: Path, options: Options) -> bool:
@@ -522,10 +550,13 @@ def write_cbz(plan: FolderPlan, options: Options) -> list[ArchiveEntry]:
                     archive.write(converted_files[entry.arcname], arcname=entry.arcname)
                 else:
                     assert magick is not None and options.convert_to is not None
-                    started = time.perf_counter()
-                    data = convert_image(entry.source, options.convert_to, magick)
-                    if options.timing is not None:
-                        options.timing.add_convert(time.perf_counter() - started)
+                    data = convert_image(
+                        entry.source,
+                        options.convert_to,
+                        magick,
+                        gate=options.convert_gate,
+                        timing=options.timing,
+                    )
                     archive.writestr(entry.arcname, data)
         tmp_path.replace(plan.output)
     except Exception:
@@ -548,12 +579,18 @@ def convert_pages_to_files(
     convert_to = options.convert_to
     suffix = CONVERT_TARGETS[convert_to]
     workers = min(options.jobs, len(entries))
-    started = time.perf_counter()
 
     def work(item: tuple[int, ArchiveEntry]) -> tuple[str, Path]:
         index, entry = item
         dest = dest_dir / f"{index:05d}{suffix}"
-        convert_image(entry.source, convert_to, magick, dest=dest)
+        convert_image(
+            entry.source,
+            convert_to,
+            magick,
+            dest=dest,
+            gate=options.convert_gate,
+            timing=options.timing,
+        )
         return entry.arcname, dest
 
     converted: dict[str, Path] = {}
@@ -562,8 +599,6 @@ def convert_pages_to_files(
         for future in as_completed(futures):
             name, dest = future.result()
             converted[name] = dest
-    if options.timing is not None:
-        options.timing.add_convert(time.perf_counter() - started)
     return converted
 
 
@@ -944,16 +979,15 @@ def run(options: Options) -> list[PackResult]:
     discover_started = time.perf_counter()
     plans = plan_conversions(options)
     timing.discover = time.perf_counter() - discover_started
-    converting = False
     if needs_conversion(plans, options):
         magick = find_imagemagick(options.imagemagick)
         if magick:
             options.imagemagick = magick
-            converting = True
         else:
             warn_and_skip_conversion(options)
+    options.convert_gate = threading.BoundedSemaphore(max(1, options.jobs))
     pack_started = time.perf_counter()
-    if converting or options.jobs <= 1 or options.dry_run or len(plans) <= 1:
+    if options.jobs <= 1 or options.dry_run or len(plans) <= 1:
         results = [convert_folder(plan, options) for plan in plans]
     else:
         with ThreadPoolExecutor(max_workers=options.jobs) as pool:

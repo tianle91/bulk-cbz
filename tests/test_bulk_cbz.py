@@ -465,6 +465,24 @@ class BulkCbzTests(unittest.TestCase):
             self.assertTrue(zip_bytes(root / "Ch.cbz", "b.png").startswith(PNG_SIGNATURE))
             self.assertEqual(zip_bytes(root / "Ch.cbz", "keep.jpg"), b"jpeg-bytes")
 
+    def test_jobs_pack_convert_and_native_chapters_together(self) -> None:
+        require_imagemagick()
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_im_image(root / "Webp 1" / "01.webp", "WEBP")
+            write_im_image(root / "Webp 2" / "01.webp", "WEBP")
+            write_file(root / "Jpeg 1" / "01.jpg")
+            write_file(root / "Jpeg 1" / "02.jpg")
+            write_file(root / "Jpeg 2" / "01.jpg")
+            write_file(root / "Jpeg 2" / "02.jpg")
+
+            code, _stdout, stderr = run_cli([str(root), "--jobs", "2"])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(zip_names(root / "Webp 1.cbz"), ["01.png"])
+            self.assertEqual(zip_names(root / "Webp 2.cbz"), ["01.png"])
+            self.assertEqual(zip_names(root / "Jpeg 1.cbz"), ["01.jpg", "02.jpg"])
+            self.assertEqual(zip_names(root / "Jpeg 2.cbz"), ["01.jpg", "02.jpg"])
+
     def test_convert_to_jpeg_flattens_transparency(self) -> None:
         require_imagemagick()
         with TemporaryDirectory() as raw:

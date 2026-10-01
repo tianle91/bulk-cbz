@@ -24,7 +24,7 @@ Leaf-chapter packing, quieter logs, and faster packing.
 - Status logs print a path relative to the scan root once (`Author/Series/Chapter.cbz`) instead of repeating long source and output directories. Verbose mode lists page filenames only.
 - CLI flags are grouped into discovery, output, images, and logging.
 - Discovery finds leaf chapters by walking ancestors (`O(n × depth)`), so names that share a natural-sort key cannot hide a descendant.
-- Chapters are packed in parallel. ImageMagick conversions within a chapter run in parallel (default: CPU count, max 8) and spill to temporary files so a whole chapter is not held in RAM.
+- Chapters are packed in parallel. ImageMagick conversions share the same `--jobs` budget across chapters and pages (a semaphore caps concurrent magick processes) and spill to temporary files so a whole chapter is not held in RAM.
 
 ### Fixed
 
