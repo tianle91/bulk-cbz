@@ -23,8 +23,13 @@ Leaf-chapter packing, quieter logs, and faster packing.
 - ZIP entries are always stored uncompressed.
 - Status logs print a path relative to the scan root once (`Author/Series/Chapter.cbz`) instead of repeating long source and output directories. Verbose mode lists page filenames only.
 - CLI flags are grouped into discovery, output, images, and logging.
-- Discovery scans each folder once and finds leaf chapters in linear time.
-- Chapters are packed in parallel, and ImageMagick conversions within a chapter run in parallel (default: CPU count, max 8).
+- Discovery finds leaf chapters by walking ancestors (`O(n × depth)`), so names that share a natural-sort key cannot hide a descendant.
+- Chapters are packed in parallel. ImageMagick conversions within a chapter run in parallel (default: CPU count, max 8) and spill to temporary files so a whole chapter is not held in RAM.
+
+### Fixed
+
+- `Chapter 1` next to `Chapter 01` no longer packs the parent folder when `Chapter 1/pages` is the real leaf.
+- Parallel conversion no longer accumulates every encoded page in memory before writing the ZIP.
 
 ### Removed
 

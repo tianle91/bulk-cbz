@@ -345,6 +345,33 @@ class BulkCbzTests(unittest.TestCase):
         self.assertNotIn(author, leaves)
         self.assertNotIn(series, leaves)
 
+    def test_select_leaves_when_natural_keys_collide(self) -> None:
+        self.assertEqual(bulk_cbz.natural_key("Chapter 1"), bulk_cbz.natural_key("Chapter 01"))
+        chapter_1 = Path("/lib/Chapter 1")
+        chapter_01 = Path("/lib/Chapter 01")
+        nested = Path("/lib/Chapter 1/pages")
+        leaves = bulk_cbz.select_leaves([chapter_1, chapter_01, nested])
+        self.assertEqual(set(leaves), {chapter_01, nested})
+        self.assertNotIn(chapter_1, leaves)
+
+    def test_colliding_names_pack_nested_leaf_not_parent(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_file(root / "Chapter 01" / "01.jpg")
+            write_file(root / "Chapter 01" / "02.jpg")
+            write_file(root / "Chapter 1" / "cover.jpg")
+            write_file(root / "Chapter 1" / "pages" / "01.jpg")
+            write_file(root / "Chapter 1" / "pages" / "02.jpg")
+
+            code, _stdout, stderr = run_cli([str(root), "--jobs", "1", "--delete-folders"])
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue((root / "Chapter 01.cbz").is_file())
+            self.assertTrue((root / "Chapter 1" / "pages.cbz").is_file())
+            self.assertFalse((root / "Chapter 1.cbz").exists())
+            self.assertFalse((root / "Chapter 01").exists())
+            self.assertFalse((root / "Chapter 1" / "pages").exists())
+            self.assertTrue((root / "Chapter 1" / "cover.jpg").is_file())
+
     def test_parallel_jobs_match_serial_archives(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
@@ -421,6 +448,22 @@ class BulkCbzTests(unittest.TestCase):
             converted = zip_bytes(root / "Ch.cbz", "page.png")
             self.assertTrue(converted.startswith(PNG_SIGNATURE))
             self.assertEqual(png_color_type(converted), 6)
+
+    def test_parallel_convert_writes_pages_in_order(self) -> None:
+        require_imagemagick()
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            folder = root / "Ch"
+            write_im_image(folder / "a.webp", "WEBP")
+            write_im_image(folder / "b.webp", "WEBP")
+            write_file(folder / "keep.jpg", b"jpeg-bytes")
+
+            code, _stdout, stderr = run_cli([str(root), "--jobs", "2"])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(zip_names(root / "Ch.cbz"), ["a.png", "b.png", "keep.jpg"])
+            self.assertTrue(zip_bytes(root / "Ch.cbz", "a.png").startswith(PNG_SIGNATURE))
+            self.assertTrue(zip_bytes(root / "Ch.cbz", "b.png").startswith(PNG_SIGNATURE))
+            self.assertEqual(zip_bytes(root / "Ch.cbz", "keep.jpg"), b"jpeg-bytes")
 
     def test_convert_to_jpeg_flattens_transparency(self) -> None:
         require_imagemagick()

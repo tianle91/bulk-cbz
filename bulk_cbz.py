@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -218,10 +219,16 @@ def find_imagemagick(explicit: str | None = None) -> str | None:
     return None
 
 
-def convert_image(path: Path, convert_to: str, magick: str) -> bytes:
-    output = {
-        "png": ["-alpha", "set", "PNG32:-"],
-        "jpeg": [
+def convert_output_args(convert_to: str, dest: Path | None = None) -> list[str]:
+    sink = {
+        "png": "PNG32:-" if dest is None else f"PNG32:{dest}",
+        "jpeg": "JPEG:-" if dest is None else f"JPEG:{dest}",
+        "webp": "WEBP:-" if dest is None else f"WEBP:{dest}",
+    }[convert_to]
+    if convert_to == "png":
+        return ["-alpha", "set", sink]
+    if convert_to == "jpeg":
+        return [
             "-background",
             "white",
             "-alpha",
@@ -230,11 +237,13 @@ def convert_image(path: Path, convert_to: str, magick: str) -> bytes:
             "off",
             "-quality",
             "90",
-            "JPEG:-",
-        ],
-        "webp": ["-quality", "90", "WEBP:-"],
-    }[convert_to]
-    cmd = [magick, f"{path.resolve()}[0]", "-auto-orient", *output]
+            sink,
+        ]
+    return ["-quality", "90", sink]
+
+
+def convert_image(path: Path, convert_to: str, magick: str, dest: Path | None = None) -> bytes:
+    cmd = [magick, f"{path.resolve()}[0]", "-auto-orient", *convert_output_args(convert_to, dest)]
     try:
         proc = subprocess.run(
             cmd,
@@ -243,6 +252,11 @@ def convert_image(path: Path, convert_to: str, magick: str) -> bytes:
         )
     except subprocess.TimeoutExpired as exc:
         raise BulkCbzError(f"ImageMagick timed out converting {path}") from exc
+    if dest is not None:
+        if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
+            raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
+        return b""
     if proc.returncode != 0 or not proc.stdout:
         err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
         raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
@@ -350,17 +364,22 @@ def discover_folders(
 def select_leaves(folders: Sequence[Path]) -> list[Path]:
     """Return folders that have no descendant in ``folders``.
 
-    After a natural-path sort, a parent is immediately followed by a descendant
-    if one exists, so this is linear in the number of folders.
+    Walks each path's ancestors instead of assuming a natural-sort adjacency.
+    Names such as ``Chapter 1`` and ``Chapter 01`` share a natural-sort key, so
+    a next-item prefix check can miss a descendant sitting after a sibling.
     """
-    ordered = sorted(folders, key=natural_path_key)
-    leaves: list[Path] = []
-    for index, folder in enumerate(ordered):
-        prefix = str(folder) + os.sep
-        if index + 1 < len(ordered) and str(ordered[index + 1]).startswith(prefix):
-            continue
-        leaves.append(folder)
-    return leaves
+    folder_set = set(folders)
+    has_descendant: set[Path] = set()
+    for folder in folders:
+        current = folder.parent
+        while True:
+            if current in folder_set:
+                has_descendant.add(current)
+            nxt = current.parent
+            if nxt == current:
+                break
+            current = nxt
+    return [folder for folder in folders if folder not in has_descendant]
 
 
 def is_image_page(path: Path, options: Options) -> bool:
@@ -475,11 +494,21 @@ def write_cbz(plan: FolderPlan, options: Options) -> list[ArchiveEntry]:
                 )
                 for entry in entries
             ]
-    converted = convert_pages(entries, options, magick)
     tmp_path = plan.output.with_name(plan.output.name + ".partial")
     if tmp_path.exists():
         tmp_path.unlink()
+    convert_tmpdir = None
+    converted_files: dict[str, Path] = {}
     try:
+        convert_entries = [entry for entry in entries if entry.convert]
+        if convert_entries:
+            assert magick is not None and options.convert_to is not None
+            workers = min(options.jobs, len(convert_entries))
+            if workers > 1:
+                convert_tmpdir = tempfile.TemporaryDirectory(prefix="bulk_cbz_convert_")
+                converted_files = convert_pages_to_files(
+                    convert_entries, options, magick, Path(convert_tmpdir.name)
+                )
         with zipfile.ZipFile(
             tmp_path,
             mode="w",
@@ -487,44 +516,52 @@ def write_cbz(plan: FolderPlan, options: Options) -> list[ArchiveEntry]:
             allowZip64=True,
         ) as archive:
             for entry in entries:
-                if entry.convert:
-                    archive.writestr(entry.arcname, converted[entry.arcname])
-                else:
+                if not entry.convert:
                     archive.write(entry.source, arcname=entry.arcname)
+                elif converted_files:
+                    archive.write(converted_files[entry.arcname], arcname=entry.arcname)
+                else:
+                    assert magick is not None and options.convert_to is not None
+                    started = time.perf_counter()
+                    data = convert_image(entry.source, options.convert_to, magick)
+                    if options.timing is not None:
+                        options.timing.add_convert(time.perf_counter() - started)
+                    archive.writestr(entry.arcname, data)
         tmp_path.replace(plan.output)
     except Exception:
         if tmp_path.exists():
             tmp_path.unlink()
         raise
+    finally:
+        if convert_tmpdir is not None:
+            convert_tmpdir.cleanup()
     return entries
 
 
-def convert_pages(
-    entries: Sequence[ArchiveEntry], options: Options, magick: str | None
-) -> dict[str, bytes]:
-    convert_entries = [entry for entry in entries if entry.convert]
-    if not convert_entries:
-        return {}
-    assert magick is not None and options.convert_to is not None
+def convert_pages_to_files(
+    entries: Sequence[ArchiveEntry],
+    options: Options,
+    magick: str,
+    dest_dir: Path,
+) -> dict[str, Path]:
+    assert options.convert_to is not None
     convert_to = options.convert_to
-    command = magick
-
-    def work(entry: ArchiveEntry) -> tuple[str, bytes]:
-        return entry.arcname, convert_image(entry.source, convert_to, command)
-
-    converted: dict[str, bytes] = {}
-    workers = min(options.jobs, len(convert_entries))
+    suffix = CONVERT_TARGETS[convert_to]
+    workers = min(options.jobs, len(entries))
     started = time.perf_counter()
-    if workers <= 1:
-        for entry in convert_entries:
-            name, data = work(entry)
-            converted[name] = data
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(work, entry) for entry in convert_entries]
-            for future in as_completed(futures):
-                name, data = future.result()
-                converted[name] = data
+
+    def work(item: tuple[int, ArchiveEntry]) -> tuple[str, Path]:
+        index, entry = item
+        dest = dest_dir / f"{index:05d}{suffix}"
+        convert_image(entry.source, convert_to, magick, dest=dest)
+        return entry.arcname, dest
+
+    converted: dict[str, Path] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(work, (index, entry)) for index, entry in enumerate(entries)]
+        for future in as_completed(futures):
+            name, dest = future.result()
+            converted[name] = dest
     if options.timing is not None:
         options.timing.add_convert(time.perf_counter() - started)
     return converted
