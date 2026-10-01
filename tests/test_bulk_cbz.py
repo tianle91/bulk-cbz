@@ -134,6 +134,23 @@ class BulkCbzTests(unittest.TestCase):
             self.assertIn("01.jpg", stdout)
             self.assertIn("02.jpg", stdout)
 
+    def test_reports_run_timings_and_file_counts(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_file(root / "Ch01" / "01.jpg")
+            write_file(root / "Ch01" / "02.jpg")
+
+            code, stdout, stderr = run_cli([str(root)])
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("files=2", stdout)
+            self.assertRegex(stdout, r"time\s+discover=\d+\.\d+s convert=\d+\.\d+s pack=\d+\.\d+s total=\d+\.\d+s")
+
+            code, stdout, stderr = run_cli([str(root), "--quiet"])
+            self.assertEqual(code, 0, stderr)
+            self.assertNotIn("ok", stdout)
+            self.assertIn("discover=", stdout)
+            self.assertIn("total=", stdout)
+
     def test_skip_existing_and_overwrite(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)

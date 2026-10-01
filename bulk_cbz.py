@@ -16,9 +16,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Sequence
 
@@ -59,6 +60,19 @@ class BulkCbzError(Exception):
 
 
 @dataclass
+class Timing:
+    discover: float = 0.0
+    convert: float = 0.0
+    pack: float = 0.0
+    total: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def add_convert(self, seconds: float) -> None:
+        with self._lock:
+            self.convert += seconds
+
+
+@dataclass
 class Options:
     directory: Path
     output: Path | None = None
@@ -76,6 +90,7 @@ class Options:
     convert_to: str | None = "png"
     imagemagick: str | None = None
     jobs: int = 1
+    timing: Timing | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -499,23 +514,37 @@ def convert_pages(
 
     converted: dict[str, bytes] = {}
     workers = min(options.jobs, len(convert_entries))
+    started = time.perf_counter()
     if workers <= 1:
         for entry in convert_entries:
             name, data = work(entry)
             converted[name] = data
-        return converted
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(work, entry) for entry in convert_entries]
-        for future in as_completed(futures):
-            name, data = future.result()
-            converted[name] = data
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(work, entry) for entry in convert_entries]
+            for future in as_completed(futures):
+                name, data = future.result()
+                converted[name] = data
+    if options.timing is not None:
+        options.timing.add_convert(time.perf_counter() - started)
     return converted
 
 
-def log(message: str, options: Options, *, error: bool = False, verbose: bool = False) -> None:
+def log(
+    message: str,
+    options: Options,
+    *,
+    error: bool = False,
+    verbose: bool = False,
+    always: bool = False,
+) -> None:
     if error:
         with _LOG_LOCK:
             print(message, file=sys.stderr)
+        return
+    if always:
+        with _LOG_LOCK:
+            print(message)
         return
     if options.quiet:
         return
@@ -594,9 +623,33 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
     )
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.3f}s"
+    minutes, rest = divmod(seconds, 60)
+    hours, minutes = divmod(int(minutes), 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{rest:05.2f}s"
+    return f"{int(minutes)}m{rest:05.2f}s"
+
+
+def log_timing(options: Options) -> None:
+    timing = options.timing
+    if timing is None:
+        return
+    detail = (
+        f"discover={format_duration(timing.discover)} "
+        f"convert={format_duration(timing.convert)} "
+        f"pack={format_duration(timing.pack)} "
+        f"total={format_duration(timing.total)}"
+    )
+    log(status_line("time", detail), options, always=True)
+
+
 def summarize(results: Sequence[PackResult], options: Options) -> int:
     if not results:
         log(status_line("done", f"no packable folders found in {display_path(options.directory, options.directory)}"), options)
+        log_timing(options)
         return 0
 
     counts = {
@@ -612,13 +665,17 @@ def summarize(results: Sequence[PackResult], options: Options) -> int:
     dry_run = counts["dry-run"]
     skipped = counts["skipped"]
     failed = counts["failed"]
+    packed_files = sum(
+        result.file_count for result in results if result.status in {"created", "dry-run"}
+    )
     log(
         status_line(
             "done",
-            f"created={created} dry-run={dry_run} skipped={skipped} failed={failed}",
+            f"created={created} dry-run={dry_run} skipped={skipped} failed={failed} files={packed_files}",
         ),
         options,
     )
+    log_timing(options)
     return 1 if failed else 0
 
 
@@ -843,7 +900,13 @@ def warn_and_skip_conversion(options: Options) -> None:
 
 
 def run(options: Options) -> list[PackResult]:
+    if options.timing is None:
+        options.timing = Timing()
+    timing = options.timing
+    started = time.perf_counter()
+    discover_started = time.perf_counter()
     plans = plan_conversions(options)
+    timing.discover = time.perf_counter() - discover_started
     converting = False
     if needs_conversion(plans, options):
         magick = find_imagemagick(options.imagemagick)
@@ -852,10 +915,15 @@ def run(options: Options) -> list[PackResult]:
             converting = True
         else:
             warn_and_skip_conversion(options)
+    pack_started = time.perf_counter()
     if converting or options.jobs <= 1 or options.dry_run or len(plans) <= 1:
-        return [convert_folder(plan, options) for plan in plans]
-    with ThreadPoolExecutor(max_workers=options.jobs) as pool:
-        return list(pool.map(lambda plan: convert_folder(plan, options), plans))
+        results = [convert_folder(plan, options) for plan in plans]
+    else:
+        with ThreadPoolExecutor(max_workers=options.jobs) as pool:
+            results = list(pool.map(lambda plan: convert_folder(plan, options), plans))
+    timing.pack = time.perf_counter() - pack_started
+    timing.total = time.perf_counter() - started
+    return results
 
 
 def main(argv: Sequence[str] | None = None) -> int:

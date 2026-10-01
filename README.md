@@ -86,6 +86,7 @@ By default the script:
 - Sorts pages naturally, so `page2` comes before `page10`
 - Stores ZIP entries uncompressed (`store`), which is typical for JPEG and PNG
 - Warns when a folder has no images (skipped) or only one image (still packed)
+- Prints a `time` line with discover / convert / pack / total durations
 - Skips existing CBZ files unless `--overwrite` is set
 - Ignores hidden folders, `__MACOSX`, and `@eaDir`
 
@@ -140,13 +141,14 @@ Conversion tests are skipped when ImageMagick is not installed.
 
 Times discovery, JPEG packing, optional ImageMagick conversion, and a
 directory-listing comparison (`os.walk`, `os.scandir`, and `find` when present)
-on a synthetic `author/series/chapter` tree. Not run in CI except for a tiny
-smoke test.
+on a synthetic `author/series/chapter` tree. Prints throughput and, when packing,
+the script's own `time` line (`discover=` / `convert=` / `pack=` / `total=`).
+Not run in CI except for a tiny smoke test.
 
 ```bash
 python3 benchmarks/bench.py --quick
 python3 benchmarks/bench.py
-python3 benchmarks/bench.py --jobs 4 --no-listing
+python3 benchmarks/bench.py --jobs 4 --repeat 3 --no-listing
 ```
 
 ## Version

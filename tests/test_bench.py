@@ -25,7 +25,20 @@ class BenchTests(unittest.TestCase):
         self.assertIn("pack jpeg --jobs 2", proc.stdout)
         self.assertIn("os.walk listing", proc.stdout)
         self.assertIn("os.scandir listing", proc.stdout)
+        self.assertRegex(proc.stdout, r"ch/s|file/s")
+        self.assertIn("cli discover=", proc.stdout)
         self.assertNotIn("convert webp --jobs 1", proc.stdout)
+
+    def test_repeat_reports_mean_and_stdev(self) -> None:
+        proc = subprocess.run(
+            [sys.executable, str(BENCH), "--quick", "--jobs", "1", "--repeat", "2", "--no-listing"],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("repeat=2", proc.stdout)
+        self.assertIn("±", proc.stdout)
 
     def test_jobs_must_be_positive(self) -> None:
         proc = subprocess.run(

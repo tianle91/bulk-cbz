@@ -10,7 +10,8 @@ Leaf-chapter packing, quieter logs, and faster packing.
 ### Added
 
 - `-j`, `--jobs N` to set the worker count. Use `--jobs 1` on a spinning disk or network share if parallel I/O hurts.
-- `benchmarks/bench.py` times discovery, packing, conversion, and `os.walk` / `os.scandir` / `find` listing on a synthetic library.
+- `benchmarks/bench.py` times discovery, packing, conversion, and `os.walk` / `os.scandir` / `find` listing on a synthetic library. Reports throughput and optional `--repeat` mean ± stdev, plus the script's own `time` line.
+- A `time` summary on every run: discover, convert, pack, and total wall-clock. Printed even with `--quiet`.
 
 ### Changed
 
