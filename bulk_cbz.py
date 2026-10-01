@@ -13,13 +13,14 @@ import fnmatch
 import os
 import re
 import shutil
+import subprocess
 import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 IMAGE_EXTENSIONS = {
     ".avif",
@@ -34,9 +35,17 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".webp",
 }
+NATIVE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+CONVERT_TARGETS = {
+    "png": ".png",
+    "jpeg": ".jpg",
+    "jpg": ".jpg",
+    "webp": ".webp",
+}
 METADATA_NAMES = {"comicinfo.xml"}
 DEFAULT_EXCLUDES = ("__MACOSX", "@eaDir")
 PARTIAL_SUFFIX = ".cbz.partial"
+CONVERT_TIMEOUT_SECONDS = 120
 
 _NATURAL_SPLIT = re.compile(r"(\d+)")
 
@@ -64,6 +73,8 @@ class Options:
     min_files: int = 1
     compression: str = "store"
     delete_folders: bool = False
+    convert_to: str | None = "png"
+    imagemagick: str | None = None
 
 
 @dataclass
@@ -80,6 +91,13 @@ class PackResult:
     status: str
     file_count: int = 0
     error: str | None = None
+
+
+@dataclass
+class ArchiveEntry:
+    source: Path
+    arcname: str
+    convert: bool
 
 
 def natural_key(value: str) -> list[tuple[int, object]]:
@@ -142,6 +160,86 @@ def zip_compression(name: str) -> int:
     if name == "deflate":
         return zipfile.ZIP_DEFLATED
     raise BulkCbzError(f"unknown compression mode: {name}")
+
+
+def normalize_convert_to(value: str) -> str:
+    if value not in CONVERT_TARGETS:
+        raise BulkCbzError(f"unknown convert-to format: {value}")
+    return "jpeg" if value == "jpg" else value
+
+
+def should_convert_file(path: Path, options: Options) -> bool:
+    if options.convert_to is None:
+        return False
+    suffix = path.suffix.lower()
+    if suffix not in IMAGE_EXTENSIONS:
+        return False
+    return suffix not in NATIVE_IMAGE_EXTENSIONS
+
+
+def converted_arcname(arcname: str, convert_to: str) -> str:
+    return str(PurePosixPath(arcname).with_suffix(CONVERT_TARGETS[convert_to]))
+
+
+def find_imagemagick(explicit: str | None = None) -> str:
+    candidates: list[str] = []
+    if explicit:
+        candidates.append(explicit)
+    else:
+        for name in ("magick", "convert"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(found)
+    for command in candidates:
+        try:
+            proc = subprocess.run(
+                [command, "-version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if explicit:
+                raise BulkCbzError(f"cannot run ImageMagick command {command}: {exc}") from exc
+            continue
+        details = f"{proc.stdout}{proc.stderr}"
+        if proc.returncode == 0 and "ImageMagick" in details:
+            return command
+    raise BulkCbzError(
+        "ImageMagick is required to convert pages that are not JPEG or PNG. "
+        "Install it (for example: apt install imagemagick) or pass --no-convert."
+    )
+
+
+def convert_image(path: Path, convert_to: str, magick: str) -> bytes:
+    output = {
+        "png": ["-alpha", "set", "PNG32:-"],
+        "jpeg": [
+            "-background",
+            "white",
+            "-alpha",
+            "remove",
+            "-alpha",
+            "off",
+            "-quality",
+            "90",
+            "JPEG:-",
+        ],
+        "webp": ["-quality", "90", "WEBP:-"],
+    }[convert_to]
+    cmd = [magick, f"{path.resolve()}[0]", "-auto-orient", *output]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=CONVERT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BulkCbzError(f"ImageMagick timed out converting {path}") from exc
+    if proc.returncode != 0 or not proc.stdout:
+        err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
+        raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
+    return proc.stdout
 
 
 def is_packable_file(path: Path, options: Options) -> bool:
@@ -282,24 +380,40 @@ def arcname_for(file: Path, folder: Path) -> str:
     return PurePosixPath(file.relative_to(folder).as_posix()).as_posix()
 
 
-def unique_arcnames(files: Sequence[Path], folder: Path) -> list[tuple[Path, str]]:
+def plan_archive_entries(
+    files: Sequence[Path], folder: Path, options: Options
+) -> list[ArchiveEntry]:
     used: dict[str, Path] = {}
-    mapping: list[tuple[Path, str]] = []
+    entries: list[ArchiveEntry] = []
     for file in files:
         name = arcname_for(file, folder)
+        convert = should_convert_file(file, options)
+        if convert:
+            assert options.convert_to is not None
+            name = converted_arcname(name, options.convert_to)
         previous = used.get(name.casefold())
         if previous is not None:
             raise BulkCbzError(
                 f"duplicate archive path {name!r} from {previous} and {file}"
             )
         used[name.casefold()] = file
-        mapping.append((file, name))
-    return mapping
+        entries.append(ArchiveEntry(source=file, arcname=name, convert=convert))
+    return entries
+
+
+def entry_log_line(entry: ArchiveEntry, folder: Path) -> str:
+    relative = entry.source.relative_to(folder)
+    if entry.convert:
+        return f"        {relative} -> {entry.arcname}"
+    return f"        {entry.arcname}"
 
 
 def write_cbz(plan: FolderPlan, options: Options) -> None:
     plan.output.parent.mkdir(parents=True, exist_ok=True)
-    entries = unique_arcnames(plan.files, plan.source)
+    entries = plan_archive_entries(plan.files, plan.source, options)
+    magick = options.imagemagick
+    if any(entry.convert for entry in entries):
+        magick = magick or find_imagemagick()
     tmp_path = plan.output.with_name(plan.output.name + ".partial")
     if tmp_path.exists():
         tmp_path.unlink()
@@ -310,8 +424,13 @@ def write_cbz(plan: FolderPlan, options: Options) -> None:
             compression=zip_compression(options.compression),
             allowZip64=True,
         ) as archive:
-            for file, name in entries:
-                archive.write(file, arcname=name)
+            for entry in entries:
+                if entry.convert:
+                    assert magick is not None and options.convert_to is not None
+                    data = convert_image(entry.source, options.convert_to, magick)
+                    archive.writestr(entry.arcname, data)
+                else:
+                    archive.write(entry.source, arcname=entry.arcname)
         tmp_path.replace(plan.output)
     except Exception:
         if tmp_path.exists():
@@ -344,12 +463,13 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
         )
 
     if options.dry_run:
+        entries = plan_archive_entries(plan.files, plan.source, options)
         log(
             f"dry   {plan.source} -> {plan.output} ({len(plan.files)} files)",
             options,
         )
-        for file in plan.files:
-            log(f"        {file.relative_to(plan.source)}", options, verbose=True)
+        for entry in entries:
+            log(entry_log_line(entry, plan.source), options, verbose=True)
         return PackResult(
             source=plan.source,
             output=plan.output,
@@ -373,8 +493,8 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
         f"ok    {plan.source} -> {plan.output} ({len(plan.files)} files)",
         options,
     )
-    for file in plan.files:
-        log(f"        {file.relative_to(plan.source)}", options, verbose=True)
+    for entry in plan_archive_entries(plan.files, plan.source, options):
+        log(entry_log_line(entry, plan.source), options, verbose=True)
 
     if options.delete_folders:
         try:
@@ -433,7 +553,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Convert every folder in a directory into a CBZ file named after "
             "that folder. Image pages are added in natural order "
-            "(page2 before page10)."
+            "(page2 before page10). Pages that are not JPEG or PNG are converted "
+            "to PNG with ImageMagick unless you pass --convert-to or --no-convert."
         ),
         epilog="""
 common usages:
@@ -456,8 +577,14 @@ common usages:
   %(prog)s ./volume --include-nested
       A chapter folder whose pages live in a subfolder still becomes one CBZ.
 
-  %(prog)s . --overwrite --delete-folders
+      %(prog)s . --overwrite --delete-folders
       Replace existing archives, then delete folders after a successful pack.
+
+  %(prog)s . --convert-to jpeg
+      Convert WebP/GIF/etc. to JPEG instead of PNG. JPEG and PNG pages stay as-is.
+
+  %(prog)s . --no-convert
+      Pack original page files without running ImageMagick.
 
   %(prog)s . --min-files 10 --exclude '*sample*'
       Skip incomplete chapters and folders whose names match a glob.
@@ -559,6 +686,21 @@ common usages:
         help="ZIP compression. store is faster and typical for already-compressed images",
     )
     parser.add_argument(
+        "--convert-to",
+        choices=("png", "jpeg", "jpg", "webp"),
+        help="Format for pages that are not JPEG or PNG (default: png). JPEG and PNG are left as-is",
+    )
+    parser.add_argument(
+        "--no-convert",
+        action="store_true",
+        help="Pack original page files without converting formats",
+    )
+    parser.add_argument(
+        "--imagemagick",
+        metavar="CMD",
+        help="ImageMagick executable to use (default: magick, then convert)",
+    )
+    parser.add_argument(
         "--delete-folders",
         action="store_true",
         help="Delete each source folder after it is packed successfully",
@@ -588,9 +730,12 @@ def options_from_args(args: argparse.Namespace) -> Options:
         raise BulkCbzError("--leaves-only requires --recursive")
     if args.quiet and args.verbose:
         raise BulkCbzError("use either --quiet or --verbose, not both")
+    if args.no_convert and args.convert_to:
+        raise BulkCbzError("use either --convert-to or --no-convert, not both")
 
     extra_excludes = tuple(args.exclude) if args.exclude else ()
     exclude = DEFAULT_EXCLUDES + extra_excludes
+    convert_to = None if args.no_convert else normalize_convert_to(args.convert_to or "png")
     return Options(
         directory=directory,
         output=output,
@@ -609,11 +754,24 @@ def options_from_args(args: argparse.Namespace) -> Options:
         min_files=args.min_files,
         compression=args.compression,
         delete_folders=args.delete_folders,
+        convert_to=convert_to,
+        imagemagick=args.imagemagick,
+    )
+
+
+def needs_conversion(plans: Sequence[FolderPlan], options: Options) -> bool:
+    return any(
+        should_convert_file(path, options)
+        for plan in plans
+        for path in plan.files
     )
 
 
 def run(options: Options) -> list[PackResult]:
-    return [convert_folder(plan, options) for plan in plan_conversions(options)]
+    plans = plan_conversions(options)
+    if needs_conversion(plans, options) and not options.dry_run:
+        options.imagemagick = find_imagemagick(options.imagemagick)
+    return [convert_folder(plan, options) for plan in plans]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
