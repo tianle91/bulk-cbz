@@ -312,6 +312,45 @@ class BulkCbzTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("unrecognized arguments: --recursive", stderr)
 
+    def test_jobs_must_be_at_least_one(self) -> None:
+        code, _stdout, stderr = run_cli([".", "--jobs", "0"])
+        self.assertEqual(code, 2)
+        self.assertIn("--jobs must be at least 1", stderr)
+
+    def test_select_leaves_ignores_ancestors(self) -> None:
+        author = Path("/lib/Author")
+        series = Path("/lib/Author/Series")
+        chapter_1 = Path("/lib/Author/Series/Chapter 1")
+        chapter_2 = Path("/lib/Author/Series/Chapter 2")
+        other = Path("/lib/Author Extra/Ch")
+        leaves = bulk_cbz.select_leaves([author, series, chapter_2, chapter_1, other])
+        self.assertEqual(set(leaves), {chapter_1, chapter_2, other})
+        self.assertNotIn(author, leaves)
+        self.assertNotIn(series, leaves)
+
+    def test_parallel_jobs_match_serial_archives(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            for name in ("Ch 1", "Ch 2", "Ch 10"):
+                write_file(root / name / "01.jpg", f"{name}-1".encode())
+                write_file(root / name / "02.jpg", f"{name}-2".encode())
+
+            self.assertEqual(run_cli([str(root), "--jobs", "1"])[0], 0)
+            serial = {
+                path.name: (zip_names(path), path.read_bytes())
+                for path in sorted(root.glob("*.cbz"))
+            }
+            for path in root.glob("*.cbz"):
+                path.unlink()
+
+            code, _stdout, stderr = run_cli([str(root), "--jobs", "3"])
+            self.assertEqual(code, 0, stderr)
+            parallel = {
+                path.name: (zip_names(path), path.read_bytes())
+                for path in sorted(root.glob("*.cbz"))
+            }
+            self.assertEqual(parallel, serial)
+
     def test_folder_names_with_dots_keep_full_name(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
@@ -329,6 +368,7 @@ class BulkCbzTests(unittest.TestCase):
         self.assertIn("--dry-run", stdout)
         self.assertIn("--convert-to", stdout)
         self.assertIn("--immediate", stdout)
+        self.assertIn("--jobs", stdout)
         self.assertNotIn("--recursive", stdout)
         self.assertNotIn("--min-files", stdout)
         self.assertNotIn("--include-nested", stdout)

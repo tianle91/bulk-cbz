@@ -63,6 +63,12 @@ Pack original page files without converting formats:
 python3 bulk_cbz.py . --no-convert
 ```
 
+Use more workers for a local SSD (default is CPU count, max 8):
+
+```bash
+python3 bulk_cbz.py . --jobs 4
+```
+
 Skip folders whose names match a glob:
 
 ```bash
@@ -100,6 +106,7 @@ By default the script:
 | Option | Purpose |
 | --- | --- |
 | `-o`, `--output DIR` | Write CBZ files under this directory |
+| `-j`, `--jobs N` | Parallel workers for packing and conversion (default: CPU count, max 8) |
 | `-f`, `--overwrite` | Replace existing CBZ files |
 | `--delete-folders` | Remove each source folder after it is packed |
 

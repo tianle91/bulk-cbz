@@ -5,7 +5,11 @@ script version is the `__version__` string in `bulk_cbz.py` (`python3 bulk_cbz.p
 
 ## [1.2.0] - Unreleased
 
-Leaf-chapter packing and quieter logs.
+Leaf-chapter packing, quieter logs, and faster packing.
+
+### Added
+
+- `-j`, `--jobs N` to set the worker count. Use `--jobs 1` on a spinning disk or network share if parallel I/O hurts.
 
 ### Changed
 
@@ -17,6 +21,8 @@ Leaf-chapter packing and quieter logs.
 - ZIP entries are always stored uncompressed.
 - Status logs print a path relative to the scan root once (`Author/Series/Chapter.cbz`) instead of repeating long source and output directories. Verbose mode lists page filenames only.
 - CLI flags are grouped into discovery, output, images, and logging.
+- Discovery scans each folder once and finds leaf chapters in linear time.
+- Chapters are packed in parallel, and ImageMagick conversions within a chapter run in parallel (default: CPU count, max 8).
 
 ### Removed
 
