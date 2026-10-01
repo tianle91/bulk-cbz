@@ -329,6 +329,27 @@ def output_path_for(folder: Path, root: Path, options: Options) -> Path:
     return options.output / relative.parent / f"{relative.name}.cbz"
 
 
+def display_path(path: Path, root: Path) -> str:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return path.as_posix()
+    text = relative.as_posix()
+    return "." if text == "." else text
+
+
+def describe_plan(plan: FolderPlan, root: Path) -> str:
+    source = display_path(plan.source, root)
+    default_output = plan.source.parent / f"{plan.source.name}.cbz"
+    if plan.output.resolve() == default_output.resolve():
+        return f"{source}.cbz"
+    return f"{source} -> {display_path(plan.output, root)}"
+
+
+def status_line(kind: str, detail: str) -> str:
+    return f"{kind:<5} {detail}"
+
+
 def plan_conversions(options: Options) -> list[FolderPlan]:
     root = options.directory
     folders = discover_folders(root, options)
@@ -337,10 +358,10 @@ def plan_conversions(options: Options) -> list[FolderPlan]:
         files = collect_files(folder, options)
         images = count_images(files, options)
         if images == 0:
-            log(f"warn  {folder}: no images, skipping", options, error=True)
+            log(status_line("warn", f"{display_path(folder, root)}: no images, skipping"), options, error=True)
             continue
         if images == 1:
-            log(f"warn  {folder}: only 1 image", options, error=True)
+            log(status_line("warn", f"{display_path(folder, root)}: only 1 image"), options, error=True)
         plans.append(
             FolderPlan(
                 source=folder,
@@ -376,11 +397,11 @@ def plan_archive_entries(
     return entries
 
 
-def entry_log_line(entry: ArchiveEntry, folder: Path) -> str:
-    relative = entry.source.relative_to(folder)
-    if entry.convert:
-        return f"        {relative} -> {entry.arcname}"
-    return f"        {entry.arcname}"
+def entry_log_line(entry: ArchiveEntry) -> str:
+    name = entry.source.name
+    if entry.convert and entry.arcname != name:
+        return f"       {name} -> {entry.arcname}"
+    return f"       {entry.arcname}"
 
 
 def write_cbz(plan: FolderPlan, options: Options) -> None:
@@ -434,11 +455,10 @@ def log(message: str, options: Options, *, error: bool = False, verbose: bool = 
 
 
 def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
+    root = options.directory
+    label = describe_plan(plan, root)
     if plan.output.exists() and not options.overwrite:
-        log(
-            f"skip  {plan.source.name}: {plan.output} already exists",
-            options,
-        )
+        log(status_line("skip", f"{label} (exists)"), options)
         return PackResult(
             source=plan.source,
             output=plan.output,
@@ -448,12 +468,9 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
 
     if options.dry_run:
         entries = plan_archive_entries(plan.files, plan.source, options)
-        log(
-            f"dry   {plan.source} -> {plan.output} ({len(plan.files)} files)",
-            options,
-        )
+        log(status_line("dry", f"{label} ({len(plan.files)} files)"), options)
         for entry in entries:
-            log(entry_log_line(entry, plan.source), options, verbose=True)
+            log(entry_log_line(entry), options, verbose=True)
         return PackResult(
             source=plan.source,
             output=plan.output,
@@ -464,7 +481,7 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
     try:
         write_cbz(plan, options)
     except Exception as exc:
-        log(f"error {plan.source}: {exc}", options, error=True)
+        log(status_line("error", f"{display_path(plan.source, root)}: {exc}"), options, error=True)
         return PackResult(
             source=plan.source,
             output=plan.output,
@@ -473,20 +490,20 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
             error=str(exc),
         )
 
-    log(
-        f"ok    {plan.source} -> {plan.output} ({len(plan.files)} files)",
-        options,
-    )
+    log(status_line("ok", f"{label} ({len(plan.files)} files)"), options)
     for entry in plan_archive_entries(plan.files, plan.source, options):
-        log(entry_log_line(entry, plan.source), options, verbose=True)
+        log(entry_log_line(entry), options, verbose=True)
 
     if options.delete_folders:
         try:
             shutil.rmtree(plan.source)
-            log(f"rm    {plan.source}", options)
+            log(status_line("rm", display_path(plan.source, root)), options)
         except OSError as exc:
             log(
-                f"error {plan.source}: packed, but failed to delete folder: {exc}",
+                status_line(
+                    "error",
+                    f"{display_path(plan.source, root)}: packed, but failed to delete folder: {exc}",
+                ),
                 options,
                 error=True,
             )
@@ -508,7 +525,7 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
 
 def summarize(results: Sequence[PackResult], options: Options) -> int:
     if not results:
-        log(f"done  no packable folders found in {options.directory}", options)
+        log(status_line("done", f"no packable folders found in {display_path(options.directory, options.directory)}"), options)
         return 0
 
     counts = {
@@ -525,7 +542,10 @@ def summarize(results: Sequence[PackResult], options: Options) -> int:
     skipped = counts["skipped"]
     failed = counts["failed"]
     log(
-        f"done  created={created} dry-run={dry_run} skipped={skipped} failed={failed}",
+        status_line(
+            "done",
+            f"created={created} dry-run={dry_run} skipped={skipped} failed={failed}",
+        ),
         options,
     )
     return 1 if failed else 0
@@ -733,15 +753,15 @@ def needs_conversion(plans: Sequence[FolderPlan], options: Options) -> bool:
 def warn_and_skip_conversion(options: Options) -> None:
     if options.imagemagick:
         message = (
-            f"warn  ImageMagick command {options.imagemagick} is not available; "
+            f"ImageMagick command {options.imagemagick} is not available; "
             "packing original page files without conversion"
         )
     else:
         message = (
-            "warn  ImageMagick not available; "
+            "ImageMagick not available; "
             "packing original page files without conversion"
         )
-    log(message, options, error=True)
+    log(status_line("warn", message), options, error=True)
     options.convert_to = None
 
 

@@ -118,6 +118,21 @@ class BulkCbzTests(unittest.TestCase):
             self.assertFalse((root / "Chapter 01.cbz").exists())
             self.assertIn("dry", stdout)
             self.assertIn("01.jpg", stdout)
+            self.assertIn("Chapter 01.cbz", stdout)
+
+    def test_logs_relative_cbz_path_once(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_file(root / "Author" / "Series" / "Ch01" / "01.jpg")
+            write_file(root / "Author" / "Series" / "Ch01" / "02.jpg")
+
+            code, stdout, stderr = run_cli([str(root), "--verbose"])
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("Author/Series/Ch01.cbz", stdout)
+            self.assertNotIn(str(root), stdout)
+            self.assertNotIn("Ch01 -> ", stdout)
+            self.assertIn("01.jpg", stdout)
+            self.assertIn("02.jpg", stdout)
 
     def test_skip_existing_and_overwrite(self) -> None:
         with TemporaryDirectory() as raw:
