@@ -139,30 +139,41 @@ class BulkCbzTests(unittest.TestCase):
             self.assertIn("created=1", stdout)
             self.assertEqual(zip_names(root / "Ch01.cbz"), ["01.jpg", "02.jpg"])
 
-    def test_recursive_and_leaves_only(self) -> None:
+    def test_recursive_packs_leaf_chapters_not_series(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
-            series = root / "series"
+            series = root / "Author" / "Series"
             write_file(series / "cover.jpg")
-            write_file(series / "vol1" / "01.jpg")
-            write_file(series / "vol2" / "01.jpg")
+            write_file(series / "Chapter 1" / "01.jpg")
+            write_file(series / "Chapter 1" / "02.jpg")
+            write_file(series / "Chapter 2" / "01.jpg")
+            write_file(series / "Chapter 2" / "02.jpg")
 
-            run_cli([str(root), "--recursive"])
-            self.assertTrue((root / "series.cbz").is_file())
-            self.assertTrue((root / "series" / "vol1.cbz").is_file())
-            self.assertTrue((root / "series" / "vol2.cbz").is_file())
-            self.assertEqual(zip_names(root / "series.cbz"), ["cover.jpg"])
+            code, stdout, stderr = run_cli([str(root)])
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue((series / "Chapter 1.cbz").is_file())
+            self.assertTrue((series / "Chapter 2.cbz").is_file())
+            self.assertFalse((root / "Author.cbz").exists())
+            self.assertFalse((root / "Author" / "Series.cbz").exists())
+            self.assertIn("created=2", stdout)
+            self.assertNotIn("only 1 image", stderr)
 
-            (root / "series.cbz").unlink()
-            (root / "series" / "vol1.cbz").unlink()
-            (root / "series" / "vol2.cbz").unlink()
+    def test_immediate_packs_only_direct_children(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            series = root / "Series"
+            write_file(series / "cover.jpg")
+            write_file(series / "Chapter 1" / "01.jpg")
+            write_file(series / "Chapter 1" / "02.jpg")
 
-            run_cli([str(root), "--recursive", "--leaves-only"])
-            self.assertFalse((root / "series.cbz").exists())
-            self.assertTrue((root / "series" / "vol1.cbz").is_file())
-            self.assertTrue((root / "series" / "vol2.cbz").is_file())
+            code, stdout, stderr = run_cli([str(root), "--immediate"])
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue((root / "Series.cbz").is_file())
+            self.assertEqual(zip_names(root / "Series.cbz"), ["cover.jpg"])
+            self.assertFalse((series / "Chapter 1.cbz").exists())
+            self.assertIn("only 1 image", stderr)
 
-    def test_include_nested_packs_subfolder_pages(self) -> None:
+    def test_nested_page_folder_is_the_packed_leaf(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
             chapter = root / "Chapter 03"
@@ -170,15 +181,11 @@ class BulkCbzTests(unittest.TestCase):
             write_file(chapter / "pages" / "02.jpg")
 
             self.assertEqual(run_cli([str(root)])[0], 0)
+            self.assertTrue((chapter / "pages.cbz").is_file())
             self.assertFalse((root / "Chapter 03.cbz").exists())
+            self.assertEqual(zip_names(chapter / "pages.cbz"), ["01.jpg", "02.jpg"])
 
-            self.assertEqual(run_cli([str(root), "--include-nested"])[0], 0)
-            self.assertEqual(
-                zip_names(root / "Chapter 03.cbz"),
-                ["pages/01.jpg", "pages/02.jpg"],
-            )
-
-    def test_output_dir_min_files_exclude_and_hidden(self) -> None:
+    def test_output_dir_exclude_and_hidden(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
             source = root / "src"
@@ -196,19 +203,35 @@ class BulkCbzTests(unittest.TestCase):
                     str(source),
                     "--output",
                     str(output),
-                    "--min-files",
-                    "2",
                     "--exclude",
                     "*sample*",
                 ]
             )
-            self.assertEqual(code, 0, stderr)
+            self.assertEqual(code, 0)
             self.assertTrue((output / "Keep.cbz").is_file())
-            self.assertFalse((output / "Thin.cbz").exists())
+            self.assertTrue((output / "Thin.cbz").is_file())
             self.assertFalse((output / "sample extras.cbz").exists())
             self.assertFalse((output / ".hidden.cbz").exists())
             self.assertFalse((output / "__MACOSX.cbz").exists())
-            self.assertIn("created=1", stdout)
+            self.assertIn("created=2", stdout)
+            self.assertIn("only 1 image", stderr)
+
+    def test_warns_when_folder_has_no_images_or_one_image(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_file(root / "Empty" / "notes.txt")
+            write_file(root / "One" / "01.jpg")
+            write_file(root / "Two" / "01.jpg")
+            write_file(root / "Two" / "02.jpg")
+
+            code, stdout, stderr = run_cli([str(root), "--immediate"])
+            self.assertEqual(code, 0)
+            self.assertFalse((root / "Empty.cbz").exists())
+            self.assertTrue((root / "One.cbz").is_file())
+            self.assertTrue((root / "Two.cbz").is_file())
+            self.assertIn("no images, skipping", stderr)
+            self.assertIn("only 1 image", stderr)
+            self.assertIn("created=2", stdout)
 
     def test_delete_folders_after_success(self) -> None:
         with TemporaryDirectory() as raw:
@@ -221,27 +244,25 @@ class BulkCbzTests(unittest.TestCase):
             self.assertTrue((root / "Done.cbz").is_file())
             self.assertFalse(folder.exists())
 
-    def test_extra_extension_and_compression(self) -> None:
+    def test_extra_extension_uses_store_compression(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
             folder = root / "Custom"
             write_file(folder / "page.cbz.bin", b"not-a-cbz-but-custom")
             write_file(folder / "page.bin", b"hello-hello-hello-hello")
 
-            code, _stdout, stderr = run_cli(
-                [str(root), "--ext", "bin", "--compression", "deflate"]
-            )
+            code, _stdout, stderr = run_cli([str(root), "--ext", "bin"])
             self.assertEqual(code, 0, stderr)
             archive_path = root / "Custom.cbz"
             with zipfile.ZipFile(archive_path) as archive:
                 names = archive.namelist()
                 self.assertEqual(names, ["page.bin", "page.cbz.bin"])
-                self.assertEqual(archive.getinfo("page.bin").compress_type, zipfile.ZIP_DEFLATED)
+                self.assertEqual(archive.getinfo("page.bin").compress_type, zipfile.ZIP_STORED)
 
-    def test_leaves_only_requires_recursive(self) -> None:
-        code, _stdout, stderr = run_cli([".", "--leaves-only"])
+    def test_recursive_and_immediate_are_exclusive(self) -> None:
+        code, _stdout, stderr = run_cli([".", "--recursive", "--immediate"])
         self.assertEqual(code, 2)
-        self.assertIn("--leaves-only requires --recursive", stderr)
+        self.assertIn("not allowed with argument", stderr)
 
     def test_folder_names_with_dots_keep_full_name(self) -> None:
         with TemporaryDirectory() as raw:
@@ -259,6 +280,10 @@ class BulkCbzTests(unittest.TestCase):
         self.assertIn("common usages", stdout)
         self.assertIn("--dry-run", stdout)
         self.assertIn("--convert-to", stdout)
+        self.assertIn("--immediate", stdout)
+        self.assertNotIn("--min-files", stdout)
+        self.assertNotIn("--include-nested", stdout)
+        self.assertNotIn("--leaves-only", stdout)
 
     def test_no_convert_and_convert_to_are_exclusive(self) -> None:
         code, _stdout, stderr = run_cli([".", "--no-convert", "--convert-to", "jpeg"])

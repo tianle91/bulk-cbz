@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Convert each folder in a directory into a CBZ comic archive.
 
-A CBZ file is a ZIP archive of page images. This script walks a parent
-directory (the current working directory by default) and packs every
-child folder into ``FolderName.cbz``.
+A CBZ file is a ZIP archive of page images. Nested libraries are packed at
+the leaf folders, so ``Author/Series/Chapter/01.jpg`` becomes
+``Author/Series/Chapter.cbz``.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 IMAGE_EXTENSIONS = {
     ".avif",
@@ -62,16 +62,12 @@ class Options:
     verbose: bool = False
     quiet: bool = False
     overwrite: bool = False
-    recursive: bool = False
-    leaves_only: bool = False
-    include_nested: bool = False
+    recursive: bool = True
     all_files: bool = False
     include_hidden: bool = False
     follow_symlinks: bool = False
     extra_extensions: tuple[str, ...] = ()
     exclude: tuple[str, ...] = DEFAULT_EXCLUDES
-    min_files: int = 1
-    compression: str = "store"
     delete_folders: bool = False
     convert_to: str | None = "png"
     imagemagick: str | None = None
@@ -152,14 +148,6 @@ def is_hidden(path: Path, root: Path) -> bool:
 
 def matches_exclude(name: str, patterns: Sequence[str]) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
-
-
-def zip_compression(name: str) -> int:
-    if name == "store":
-        return zipfile.ZIP_STORED
-    if name == "deflate":
-        return zipfile.ZIP_DEFLATED
-    raise BulkCbzError(f"unknown compression mode: {name}")
 
 
 def normalize_convert_to(value: str) -> str:
@@ -254,27 +242,6 @@ def is_packable_file(path: Path, options: Options) -> bool:
 
 
 def iter_candidate_files(folder: Path, options: Options) -> Iterable[Path]:
-    if options.include_nested:
-        walker = os.walk(
-            folder,
-            followlinks=options.follow_symlinks,
-            topdown=True,
-        )
-        for dirpath, dirnames, filenames in walker:
-            current = Path(dirpath)
-            dirnames[:] = [
-                name
-                for name in dirnames
-                if not matches_exclude(name, options.exclude)
-                and (options.include_hidden or not name.startswith("."))
-            ]
-            dirnames.sort(key=natural_key)
-            for name in filenames:
-                path = current / name
-                if is_packable_file(path, options):
-                    yield path
-        return
-
     try:
         entries = list(folder.iterdir())
     except OSError:
@@ -331,16 +298,28 @@ def discover_folders(root: Path, options: Options) -> list[Path]:
         dirnames.sort(key=natural_key)
         if current == root:
             continue
-        if collect_files(current, options):
-            found.append(current)
+        found.append(current)
     found.sort(key=natural_path_key)
-    return found
+    packable = [folder for folder in found if collect_files(folder, options)]
+    return [folder for folder in packable if is_leaf_folder(folder, packable)]
 
 
 def is_leaf_folder(folder: Path, folders: Sequence[Path]) -> bool:
     folder_str = str(folder)
     prefix = folder_str + os.sep
     return not any(str(other).startswith(prefix) for other in folders if other != folder)
+
+
+def is_image_page(path: Path, options: Options) -> bool:
+    if path.name.casefold() in METADATA_NAMES:
+        return False
+    suffix = path.suffix.lower()
+    extra = {normalize_extension(ext) for ext in options.extra_extensions}
+    return suffix in IMAGE_EXTENSIONS or suffix in extra
+
+
+def count_images(files: Sequence[Path], options: Options) -> int:
+    return sum(1 for path in files if is_image_page(path, options))
 
 
 def output_path_for(folder: Path, root: Path, options: Options) -> Path:
@@ -353,14 +332,15 @@ def output_path_for(folder: Path, root: Path, options: Options) -> Path:
 def plan_conversions(options: Options) -> list[FolderPlan]:
     root = options.directory
     folders = discover_folders(root, options)
-    if options.leaves_only:
-        folders = [folder for folder in folders if is_leaf_folder(folder, folders)]
-
     plans: list[FolderPlan] = []
     for folder in folders:
         files = collect_files(folder, options)
-        if len(files) < options.min_files:
+        images = count_images(files, options)
+        if images == 0:
+            log(f"warn  {folder}: no images, skipping", options, error=True)
             continue
+        if images == 1:
+            log(f"warn  {folder}: only 1 image", options, error=True)
         plans.append(
             FolderPlan(
                 source=folder,
@@ -425,7 +405,7 @@ def write_cbz(plan: FolderPlan, options: Options) -> None:
         with zipfile.ZipFile(
             tmp_path,
             mode="w",
-            compression=zip_compression(options.compression),
+            compression=zipfile.ZIP_STORED,
             allowZip64=True,
         ) as archive:
             for entry in entries:
@@ -555,33 +535,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bulk_cbz.py",
         description=(
-            "Convert every folder in a directory into a CBZ file named after "
-            "that folder. Image pages are added in natural order "
-            "(page2 before page10). Pages that are not JPEG or PNG are converted "
-            "to PNG with ImageMagick when it is available."
+            "Pack leaf chapter folders into CBZ archives. "
+            "Author/Series/Chapter/01.jpg becomes Author/Series/Chapter.cbz. "
+            "Only images directly inside each folder are packed, in natural order. "
+            "JPEG and PNG stay as-is; other formats convert to PNG with ImageMagick "
+            "when it is available."
         ),
         epilog="""
 common usages:
-  %(prog)s
-      Pack each folder in the current directory into FolderName.cbz.
+  %(prog)s ~/Comics
+      Pack every leaf chapter under a nested author/series/chapter library.
 
-  %(prog)s ~/Comics/One-Piece
-      Pack every volume/chapter folder in a series directory.
+  %(prog)s ~/Comics/Author/Series --immediate
+      Pack only the direct child folders of that series directory.
 
   %(prog)s . --dry-run --verbose
       Preview archives and the page files they would contain.
 
-  %(prog)s ./chapters --output ./cbz
+  %(prog)s ./library --output ./cbz
       Write CBZ files somewhere else and leave the source folders alone.
 
-  %(prog)s ./library --recursive --leaves-only
-      Walk a nested library and only pack the lowest image folders
-      (chapters), not series folders that also have a cover image.
-
-  %(prog)s ./volume --include-nested
-      A chapter folder whose pages live in a subfolder still becomes one CBZ.
-
-      %(prog)s . --overwrite --delete-folders
+  %(prog)s . --overwrite --delete-folders
       Replace existing archives, then delete folders after a successful pack.
 
   %(prog)s . --convert-to jpeg
@@ -590,8 +564,8 @@ common usages:
   %(prog)s . --no-convert
       Pack original page files without converting formats.
 
-  %(prog)s . --min-files 10 --exclude '*sample*'
-      Skip incomplete chapters and folders whose names match a glob.
+  %(prog)s . --exclude '*sample*'
+      Skip folders whose names match a glob.
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -599,120 +573,114 @@ common usages:
         "directory",
         nargs="?",
         default=".",
-        help="Parent directory whose folders become CBZ files (default: current directory)",
+        help="Library root to scan (default: current directory)",
     )
     parser.add_argument(
-        "-o",
-        "--output",
-        metavar="DIR",
-        help="Write CBZ files under this directory (default: next to each folder)",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
-    parser.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="Show what would be created without writing or deleting files",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Print every file added to an archive",
-    )
-    parser.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        help="Only print errors",
-    )
-    parser.add_argument(
-        "-f",
-        "--overwrite",
-        action="store_true",
-        help="Replace existing CBZ files (default: skip them)",
-    )
-    parser.add_argument(
+
+    discovery = parser.add_argument_group("discovery")
+    mode = discovery.add_mutually_exclusive_group()
+    mode.add_argument(
         "-r",
         "--recursive",
+        dest="recursive",
         action="store_true",
-        help="Convert folders at every nesting level, not just immediate children",
+        help="Pack leaf chapter folders under nested author/series/chapter trees (default)",
     )
-    parser.add_argument(
-        "--leaves-only",
-        action="store_true",
-        help="With --recursive, skip folders that contain other packable folders",
+    mode.add_argument(
+        "--immediate",
+        dest="recursive",
+        action="store_false",
+        help="Pack only direct child folders of the given directory",
     )
-    parser.add_argument(
-        "--include-nested",
-        action="store_true",
-        help="Include images from subfolders of each packed folder",
-    )
-    parser.add_argument(
-        "--all-files",
-        action="store_true",
-        help="Pack every file except other CBZ archives, not just images and ComicInfo.xml",
-    )
-    parser.add_argument(
-        "--include-hidden",
-        action="store_true",
-        help="Include hidden files and folders (names starting with a dot)",
-    )
-    parser.add_argument(
-        "--follow-symlinks",
-        action="store_true",
-        help="Follow symbolic links when scanning folders and files",
-    )
-    parser.add_argument(
-        "--ext",
-        action="append",
-        dest="ext",
-        metavar="EXT",
-        help="Additional image extension to pack (repeatable or comma-separated)",
-    )
-    parser.add_argument(
+    discovery.set_defaults(recursive=True)
+    discovery.add_argument(
         "--exclude",
         action="append",
         dest="exclude",
         metavar="GLOB",
         help="Skip folder names matching this glob (repeatable; default: __MACOSX, @eaDir)",
     )
-    parser.add_argument(
-        "--min-files",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Skip folders with fewer than N packable files (default: 1)",
-    )
-    parser.add_argument(
-        "--compression",
-        choices=("store", "deflate"),
-        default="store",
-        help="ZIP compression. store is faster and typical for already-compressed images",
-    )
-    parser.add_argument(
-        "--convert-to",
-        choices=("png", "jpeg", "jpg", "webp"),
-        help="Format for pages that are not JPEG or PNG (default: png). JPEG and PNG are left as-is. Skipped with a warning if ImageMagick is not available",
-    )
-    parser.add_argument(
-        "--no-convert",
+    discovery.add_argument(
+        "--include-hidden",
         action="store_true",
-        help="Pack original page files without converting formats",
+        help="Include hidden files and folders (names starting with a dot)",
     )
-    parser.add_argument(
-        "--imagemagick",
-        metavar="CMD",
-        help="ImageMagick executable to use (default: magick, then convert)",
+    discovery.add_argument(
+        "--follow-symlinks",
+        action="store_true",
+        help="Follow symbolic links when scanning folders and files",
     )
-    parser.add_argument(
+
+    output = parser.add_argument_group("output")
+    output.add_argument(
+        "-o",
+        "--output",
+        metavar="DIR",
+        help="Write CBZ files under this directory (default: next to each folder)",
+    )
+    output.add_argument(
+        "-f",
+        "--overwrite",
+        action="store_true",
+        help="Replace existing CBZ files (default: skip them)",
+    )
+    output.add_argument(
         "--delete-folders",
         action="store_true",
         help="Delete each source folder after it is packed successfully",
     )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
+
+    images = parser.add_argument_group("images")
+    images.add_argument(
+        "--convert-to",
+        choices=("png", "jpeg", "jpg", "webp"),
+        help="Format for pages that are not JPEG or PNG (default: png). JPEG and PNG are left as-is",
+    )
+    images.add_argument(
+        "--no-convert",
+        action="store_true",
+        help="Pack original page files without converting formats",
+    )
+    images.add_argument(
+        "--imagemagick",
+        metavar="CMD",
+        help="ImageMagick executable to use (default: magick, then convert)",
+    )
+    images.add_argument(
+        "--ext",
+        action="append",
+        dest="ext",
+        metavar="EXT",
+        help="Additional image extension to pack (repeatable or comma-separated)",
+    )
+    images.add_argument(
+        "--all-files",
+        action="store_true",
+        help="Also pack non-image files except other CBZ archives",
+    )
+
+    logging_group = parser.add_argument_group("logging")
+    logging_group.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="Show what would be created without writing or deleting files",
+    )
+    logging_group.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print every file added to an archive",
+    )
+    logging_group.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Only print errors and warnings",
     )
     return parser
 
@@ -728,10 +696,6 @@ def options_from_args(args: argparse.Namespace) -> Options:
     if output is not None and output.exists() and not output.is_dir():
         raise BulkCbzError(f"output path is not a directory: {output}")
 
-    if args.min_files < 1:
-        raise BulkCbzError("--min-files must be at least 1")
-    if args.leaves_only and not args.recursive:
-        raise BulkCbzError("--leaves-only requires --recursive")
     if args.quiet and args.verbose:
         raise BulkCbzError("use either --quiet or --verbose, not both")
     if args.no_convert and args.convert_to:
@@ -748,15 +712,11 @@ def options_from_args(args: argparse.Namespace) -> Options:
         quiet=args.quiet,
         overwrite=args.overwrite,
         recursive=args.recursive,
-        leaves_only=args.leaves_only,
-        include_nested=args.include_nested,
         all_files=args.all_files,
         include_hidden=args.include_hidden,
         follow_symlinks=args.follow_symlinks,
         extra_extensions=parse_extensions(args.ext),
         exclude=exclude,
-        min_files=args.min_files,
-        compression=args.compression,
         delete_folders=args.delete_folders,
         convert_to=convert_to,
         imagemagick=args.imagemagick,
@@ -769,7 +729,6 @@ def needs_conversion(plans: Sequence[FolderPlan], options: Options) -> bool:
         for plan in plans
         for path in plan.files
     )
-
 
 def warn_and_skip_conversion(options: Options) -> None:
     if options.imagemagick:
