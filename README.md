@@ -136,6 +136,19 @@ python3 -m unittest discover -s tests -v
 GitHub Actions runs that suite on every pull request across Python 3.9–3.13.
 Conversion tests are skipped when ImageMagick is not installed.
 
+## Benchmarks
+
+Times discovery, JPEG packing, optional ImageMagick conversion, and a
+directory-listing comparison (`os.walk`, `os.scandir`, and `find` when present)
+on a synthetic `author/series/chapter` tree. Not run in CI except for a tiny
+smoke test.
+
+```bash
+python3 benchmarks/bench.py --quick
+python3 benchmarks/bench.py
+python3 benchmarks/bench.py --jobs 4 --no-listing
+```
+
 ## Version
 
 `bulk_cbz.py --version` prints the current release. Release notes are in [CHANGELOG.md](CHANGELOG.md).
