@@ -10,7 +10,9 @@ Leaf-chapter packing and quieter logs.
 ### Changed
 
 - Default discovery walks nested `author/series/chapter` trees and packs **leaf** folders, so `Author/Series/Chapter/01.jpg` becomes `Author/Series/Chapter.cbz`.
-- `--recursive` always means leaf folders only. `--immediate` packs only direct children of the given directory.
+- Leaf selection uses folders that contain images, so a chapter is still packed when it has a non-image child folder such as `notes/`.
+- Empty leaf folders (and leaves with no recognized images) warn and are skipped in recursive mode as well as with `--immediate`.
+- `--immediate` packs only direct children of the given directory.
 - Only images that sit directly in a folder are packed.
 - ZIP entries are always stored uncompressed.
 - Status logs print a path relative to the scan root once (`Author/Series/Chapter.cbz`) instead of repeating long source and output directories. Verbose mode lists page filenames only.
@@ -18,6 +20,7 @@ Leaf-chapter packing and quieter logs.
 
 ### Removed
 
+- `--recursive` (leaf-chapter packing is the default; use `--immediate` to opt out)
 - `--leaves-only` (folded into default recursive packing)
 - `--include-nested`
 - `--min-files` (empty folders are skipped with a warning; a single image is packed with a warning)

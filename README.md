@@ -90,8 +90,7 @@ By default the script:
 | Option | Purpose |
 | --- | --- |
 | `directory` | Library root to scan (default: current working directory) |
-| `-r`, `--recursive` | Pack leaf chapter folders (default) |
-| `--immediate` | Pack only direct child folders of the given directory |
+| `--immediate` | Pack only direct child folders of the given directory (default: leaf chapters) |
 | `--exclude GLOB` | Skip matching folder names (repeatable) |
 | `--include-hidden` | Include dotfiles and hidden folders |
 | `--follow-symlinks` | Follow symbolic links while scanning |

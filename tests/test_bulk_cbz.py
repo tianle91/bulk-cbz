@@ -248,6 +248,39 @@ class BulkCbzTests(unittest.TestCase):
             self.assertIn("only 1 image", stderr)
             self.assertIn("created=2", stdout)
 
+    def test_recursive_warns_on_empty_leaf_folders(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_file(root / "Author" / "Series" / "Chapter" / "01.jpg")
+            write_file(root / "Author" / "Series" / "Chapter" / "02.jpg")
+            (root / "Author" / "Empty").mkdir(parents=True)
+            write_file(root / "Author" / "Odd" / "notes.txt")
+
+            code, stdout, stderr = run_cli([str(root)])
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue((root / "Author" / "Series" / "Chapter.cbz").is_file())
+            self.assertFalse((root / "Author" / "Empty.cbz").exists())
+            self.assertFalse((root / "Author" / "Odd.cbz").exists())
+            self.assertIn("Empty: no images, skipping", stderr)
+            self.assertIn("Odd: no images, skipping", stderr)
+            self.assertIn("created=1", stdout)
+
+    def test_non_image_child_folder_does_not_hide_chapter(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            chapter = root / "Chapter"
+            write_file(chapter / "01.jpg")
+            write_file(chapter / "02.jpg")
+            write_file(chapter / "notes" / "readme.txt")
+
+            code, stdout, stderr = run_cli([str(root), "--all-files"])
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue((root / "Chapter.cbz").is_file())
+            self.assertEqual(zip_names(root / "Chapter.cbz"), ["01.jpg", "02.jpg"])
+            self.assertFalse((chapter / "notes.cbz").exists())
+            self.assertIn("notes: no images, skipping", stderr)
+            self.assertIn("created=1", stdout)
+
     def test_delete_folders_after_success(self) -> None:
         with TemporaryDirectory() as raw:
             root = Path(raw)
@@ -274,10 +307,10 @@ class BulkCbzTests(unittest.TestCase):
                 self.assertEqual(names, ["page.bin", "page.cbz.bin"])
                 self.assertEqual(archive.getinfo("page.bin").compress_type, zipfile.ZIP_STORED)
 
-    def test_recursive_and_immediate_are_exclusive(self) -> None:
-        code, _stdout, stderr = run_cli([".", "--recursive", "--immediate"])
+    def test_recursive_flag_is_not_accepted(self) -> None:
+        code, _stdout, stderr = run_cli([".", "--recursive"])
         self.assertEqual(code, 2)
-        self.assertIn("not allowed with argument", stderr)
+        self.assertIn("unrecognized arguments: --recursive", stderr)
 
     def test_folder_names_with_dots_keep_full_name(self) -> None:
         with TemporaryDirectory() as raw:
@@ -296,6 +329,7 @@ class BulkCbzTests(unittest.TestCase):
         self.assertIn("--dry-run", stdout)
         self.assertIn("--convert-to", stdout)
         self.assertIn("--immediate", stdout)
+        self.assertNotIn("--recursive", stdout)
         self.assertNotIn("--min-files", stdout)
         self.assertNotIn("--include-nested", stdout)
         self.assertNotIn("--leaves-only", stdout)

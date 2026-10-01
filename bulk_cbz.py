@@ -300,8 +300,17 @@ def discover_folders(root: Path, options: Options) -> list[Path]:
             continue
         found.append(current)
     found.sort(key=natural_path_key)
-    packable = [folder for folder in found if collect_files(folder, options)]
-    return [folder for folder in packable if is_leaf_folder(folder, packable)]
+    with_images = [folder for folder in found if has_images(folder, options)]
+    image_leaves = [folder for folder in with_images if is_leaf_folder(folder, with_images)]
+    image_set = set(with_images)
+    empty_leaves = [
+        folder
+        for folder in found
+        if folder not in image_set and is_leaf_folder(folder, found)
+    ]
+    selected = image_leaves + empty_leaves
+    selected.sort(key=natural_path_key)
+    return selected
 
 
 def is_leaf_folder(folder: Path, folders: Sequence[Path]) -> bool:
@@ -320,6 +329,10 @@ def is_image_page(path: Path, options: Options) -> bool:
 
 def count_images(files: Sequence[Path], options: Options) -> int:
     return sum(1 for path in files if is_image_page(path, options))
+
+
+def has_images(folder: Path, options: Options) -> bool:
+    return count_images(collect_files(folder, options), options) > 0
 
 
 def output_path_for(folder: Path, root: Path, options: Options) -> Path:
@@ -602,19 +615,11 @@ common usages:
     )
 
     discovery = parser.add_argument_group("discovery")
-    mode = discovery.add_mutually_exclusive_group()
-    mode.add_argument(
-        "-r",
-        "--recursive",
-        dest="recursive",
-        action="store_true",
-        help="Pack leaf chapter folders under nested author/series/chapter trees (default)",
-    )
-    mode.add_argument(
+    discovery.add_argument(
         "--immediate",
         dest="recursive",
         action="store_false",
-        help="Pack only direct child folders of the given directory",
+        help="Pack only direct child folders of the given directory (default: leaf chapters)",
     )
     discovery.set_defaults(recursive=True)
     discovery.add_argument(
