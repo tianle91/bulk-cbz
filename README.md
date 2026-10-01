@@ -63,6 +63,12 @@ Pack original page files without converting formats:
 python3 bulk_cbz.py . --no-convert
 ```
 
+Use more workers for a local SSD (default is CPU count, max 8):
+
+```bash
+python3 bulk_cbz.py . --jobs 4
+```
+
 Skip folders whose names match a glob:
 
 ```bash
@@ -80,6 +86,7 @@ By default the script:
 - Sorts pages naturally, so `page2` comes before `page10`
 - Stores ZIP entries uncompressed (`store`), which is typical for JPEG and PNG
 - Warns when a folder has no images (skipped) or only one image (still packed)
+- Prints a `time` line with discover / convert / pack / total durations
 - Skips existing CBZ files unless `--overwrite` is set
 - Ignores hidden folders, `__MACOSX`, and `@eaDir`
 
@@ -100,6 +107,7 @@ By default the script:
 | Option | Purpose |
 | --- | --- |
 | `-o`, `--output DIR` | Write CBZ files under this directory |
+| `-j`, `--jobs N` | Parallel workers for packing and conversion (default: CPU count, max 8) |
 | `-f`, `--overwrite` | Replace existing CBZ files |
 | `--delete-folders` | Remove each source folder after it is packed |
 
@@ -128,6 +136,20 @@ python3 -m unittest discover -s tests -v
 
 GitHub Actions runs that suite on every pull request across Python 3.9–3.13.
 Conversion tests are skipped when ImageMagick is not installed.
+
+## Benchmarks
+
+Times discovery, JPEG packing, optional ImageMagick conversion, and a
+directory-listing comparison (`os.walk`, `os.scandir`, and `find` when present)
+on a synthetic `author/series/chapter` tree. Prints throughput and, when packing,
+the script's own `time` line (`discover=` / `convert=` / `pack=` / `total=`).
+Not run in CI except for a tiny smoke test.
+
+```bash
+python3 benchmarks/bench.py --quick
+python3 benchmarks/bench.py
+python3 benchmarks/bench.py --jobs 4 --repeat 3 --no-listing
+```
 
 ## Version
 

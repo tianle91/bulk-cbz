@@ -15,10 +15,15 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import zipfile
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Sequence
+from typing import Sequence
 
 __version__ = "1.2.0"
 
@@ -46,12 +51,38 @@ METADATA_NAMES = {"comicinfo.xml"}
 DEFAULT_EXCLUDES = ("__MACOSX", "@eaDir")
 PARTIAL_SUFFIX = ".cbz.partial"
 CONVERT_TIMEOUT_SECONDS = 120
+MAX_DEFAULT_JOBS = 8
 
 _NATURAL_SPLIT = re.compile(r"(\d+)")
+_LOG_LOCK = threading.Lock()
 
 
 class BulkCbzError(Exception):
     """Raised for usage problems that should exit with a clear message."""
+
+
+@dataclass
+class Timing:
+    discover: float = 0.0
+    convert: float = 0.0
+    pack: float = 0.0
+    total: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    _convert_inflight: int = field(default=0, repr=False, compare=False)
+    _convert_started: float | None = field(default=None, repr=False, compare=False)
+
+    def convert_enter(self) -> None:
+        with self._lock:
+            if self._convert_inflight == 0:
+                self._convert_started = time.perf_counter()
+            self._convert_inflight += 1
+
+    def convert_exit(self) -> None:
+        with self._lock:
+            self._convert_inflight -= 1
+            if self._convert_inflight == 0 and self._convert_started is not None:
+                self.convert += time.perf_counter() - self._convert_started
+                self._convert_started = None
 
 
 @dataclass
@@ -71,6 +102,9 @@ class Options:
     delete_folders: bool = False
     convert_to: str | None = "png"
     imagemagick: str | None = None
+    jobs: int = 1
+    timing: Timing | None = field(default=None, repr=False, compare=False)
+    convert_gate: threading.Semaphore | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -125,6 +159,10 @@ def normalize_extension(ext: str) -> str:
     if not ext:
         raise BulkCbzError("extensions cannot be empty")
     return ext if ext.startswith(".") else f".{ext}"
+
+
+def default_jobs() -> int:
+    return min(MAX_DEFAULT_JOBS, os.cpu_count() or 1)
 
 
 def parse_extensions(values: Sequence[str] | None) -> tuple[str, ...]:
@@ -194,10 +232,16 @@ def find_imagemagick(explicit: str | None = None) -> str | None:
     return None
 
 
-def convert_image(path: Path, convert_to: str, magick: str) -> bytes:
-    output = {
-        "png": ["-alpha", "set", "PNG32:-"],
-        "jpeg": [
+def convert_output_args(convert_to: str, dest: Path | None = None) -> list[str]:
+    sink = {
+        "png": "PNG32:-" if dest is None else f"PNG32:{dest}",
+        "jpeg": "JPEG:-" if dest is None else f"JPEG:{dest}",
+        "webp": "WEBP:-" if dest is None else f"WEBP:{dest}",
+    }[convert_to]
+    if convert_to == "png":
+        return ["-alpha", "set", sink]
+    if convert_to == "jpeg":
+        return [
             "-background",
             "white",
             "-alpha",
@@ -206,23 +250,45 @@ def convert_image(path: Path, convert_to: str, magick: str) -> bytes:
             "off",
             "-quality",
             "90",
-            "JPEG:-",
-        ],
-        "webp": ["-quality", "90", "WEBP:-"],
-    }[convert_to]
-    cmd = [magick, f"{path.resolve()}[0]", "-auto-orient", *output]
+            sink,
+        ]
+    return ["-quality", "90", sink]
+
+
+def convert_image(
+    path: Path,
+    convert_to: str,
+    magick: str,
+    dest: Path | None = None,
+    *,
+    gate: threading.Semaphore | None = None,
+    timing: Timing | None = None,
+) -> bytes:
+    if timing is not None:
+        timing.convert_enter()
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=CONVERT_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise BulkCbzError(f"ImageMagick timed out converting {path}") from exc
-    if proc.returncode != 0 or not proc.stdout:
-        err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
-        raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
-    return proc.stdout
+        with gate if gate is not None else nullcontext():
+            cmd = [magick, f"{path.resolve()}[0]", "-auto-orient", *convert_output_args(convert_to, dest)]
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=CONVERT_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise BulkCbzError(f"ImageMagick timed out converting {path}") from exc
+            if dest is not None:
+                if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+                    err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
+                    raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
+                return b""
+            if proc.returncode != 0 or not proc.stdout:
+                err = proc.stderr.decode("utf-8", errors="replace").strip() or "no image data written"
+                raise BulkCbzError(f"ImageMagick failed to convert {path}: {err}")
+            return proc.stdout
+    finally:
+        if timing is not None:
+            timing.convert_exit()
 
 
 def is_packable_file(path: Path, options: Options) -> bool:
@@ -235,25 +301,25 @@ def is_packable_file(path: Path, options: Options) -> bool:
     if options.all_files:
         return path.suffix.lower() != ".cbz" and not path.name.endswith(PARTIAL_SUFFIX)
     suffix = path.suffix.lower()
-    extra = {normalize_extension(ext) for ext in options.extra_extensions}
+    extra = options.extra_extensions
     if suffix in IMAGE_EXTENSIONS or suffix in extra:
         return True
     return path.name.casefold() in METADATA_NAMES
 
 
-def iter_candidate_files(folder: Path, options: Options) -> Iterable[Path]:
-    try:
-        entries = list(folder.iterdir())
-    except OSError:
-        return
-    for path in entries:
-        if is_packable_file(path, options):
-            yield path
-
-
-def collect_files(folder: Path, options: Options) -> list[Path]:
-    files = list(iter_candidate_files(folder, options))
-    files.sort(key=lambda path: natural_path_key(path.relative_to(folder)))
+def collect_files(folder: Path, options: Options, names: Sequence[str] | None = None) -> list[Path]:
+    if names is None:
+        try:
+            with os.scandir(folder) as iterator:
+                names = [
+                    entry.name
+                    for entry in iterator
+                    if not entry.is_dir(follow_symlinks=False)
+                ]
+        except OSError:
+            return []
+    files = [folder / name for name in names if is_packable_file(folder / name, options)]
+    files.sort(key=lambda path: natural_key(path.name))
     return files
 
 
@@ -271,20 +337,33 @@ def should_skip_dir(path: Path, root: Path, options: Options) -> bool:
     return False
 
 
-def discover_folders(root: Path, options: Options) -> list[Path]:
+def discover_folders(
+    root: Path, options: Options, file_cache: dict[Path, list[Path]] | None = None
+) -> list[Path]:
+    if file_cache is None:
+        file_cache = {}
     if not options.recursive:
         folders: list[Path] = []
         try:
-            entries = list(root.iterdir())
+            with os.scandir(root) as iterator:
+                entries = [
+                    (
+                        entry.name,
+                        Path(entry.path),
+                        entry.is_dir(follow_symlinks=options.follow_symlinks),
+                    )
+                    for entry in iterator
+                ]
         except OSError as exc:
             raise BulkCbzError(f"cannot read {root}: {exc}") from exc
-        for path in sorted(entries, key=lambda item: natural_key(item.name)):
-            if path.is_dir() and not should_skip_dir(path, root, options):
+        entries.sort(key=lambda item: natural_key(item[0]))
+        for _name, path, is_dir in entries:
+            if is_dir and not should_skip_dir(path, root, options):
                 folders.append(path)
         return folders
 
     found: list[Path] = []
-    for dirpath, dirnames, _filenames in os.walk(
+    for dirpath, dirnames, filenames in os.walk(
         root,
         followlinks=options.follow_symlinks,
         topdown=True,
@@ -299,40 +378,48 @@ def discover_folders(root: Path, options: Options) -> list[Path]:
         if current == root:
             continue
         found.append(current)
+        file_cache[current] = collect_files(current, options, filenames)
     found.sort(key=natural_path_key)
-    with_images = [folder for folder in found if has_images(folder, options)]
-    image_leaves = [folder for folder in with_images if is_leaf_folder(folder, with_images)]
+    with_images = [folder for folder in found if count_images(file_cache[folder], options) > 0]
     image_set = set(with_images)
-    empty_leaves = [
-        folder
-        for folder in found
-        if folder not in image_set and is_leaf_folder(folder, found)
-    ]
+    image_leaves = select_leaves(with_images)
+    empty_leaves = [folder for folder in select_leaves(found) if folder not in image_set]
     selected = image_leaves + empty_leaves
     selected.sort(key=natural_path_key)
     return selected
 
 
-def is_leaf_folder(folder: Path, folders: Sequence[Path]) -> bool:
-    folder_str = str(folder)
-    prefix = folder_str + os.sep
-    return not any(str(other).startswith(prefix) for other in folders if other != folder)
+def select_leaves(folders: Sequence[Path]) -> list[Path]:
+    """Return folders that have no descendant in ``folders``.
+
+    Walks each path's ancestors instead of assuming a natural-sort adjacency.
+    Names such as ``Chapter 1`` and ``Chapter 01`` share a natural-sort key, so
+    a next-item prefix check can miss a descendant sitting after a sibling.
+    """
+    folder_set = set(folders)
+    has_descendant: set[Path] = set()
+    for folder in folders:
+        current = folder.parent
+        while True:
+            if current in folder_set:
+                has_descendant.add(current)
+            nxt = current.parent
+            if nxt == current:
+                break
+            current = nxt
+    return [folder for folder in folders if folder not in has_descendant]
 
 
 def is_image_page(path: Path, options: Options) -> bool:
     if path.name.casefold() in METADATA_NAMES:
         return False
     suffix = path.suffix.lower()
-    extra = {normalize_extension(ext) for ext in options.extra_extensions}
+    extra = options.extra_extensions
     return suffix in IMAGE_EXTENSIONS or suffix in extra
 
 
 def count_images(files: Sequence[Path], options: Options) -> int:
     return sum(1 for path in files if is_image_page(path, options))
-
-
-def has_images(folder: Path, options: Options) -> bool:
-    return count_images(collect_files(folder, options), options) > 0
 
 
 def output_path_for(folder: Path, root: Path, options: Options) -> Path:
@@ -354,7 +441,7 @@ def display_path(path: Path, root: Path) -> str:
 def describe_plan(plan: FolderPlan, root: Path) -> str:
     source = display_path(plan.source, root)
     default_output = plan.source.parent / f"{plan.source.name}.cbz"
-    if plan.output.resolve() == default_output.resolve():
+    if plan.output == default_output:
         return f"{source}.cbz"
     return f"{source} -> {display_path(plan.output, root)}"
 
@@ -365,10 +452,13 @@ def status_line(kind: str, detail: str) -> str:
 
 def plan_conversions(options: Options) -> list[FolderPlan]:
     root = options.directory
-    folders = discover_folders(root, options)
+    file_cache: dict[Path, list[Path]] = {}
+    folders = discover_folders(root, options, file_cache)
     plans: list[FolderPlan] = []
     for folder in folders:
-        files = collect_files(folder, options)
+        files = file_cache.get(folder)
+        if files is None:
+            files = collect_files(folder, options)
         images = count_images(files, options)
         if images == 0:
             log(status_line("warn", f"{display_path(folder, root)}: no images, skipping"), options, error=True)
@@ -417,7 +507,7 @@ def entry_log_line(entry: ArchiveEntry) -> str:
     return f"       {entry.arcname}"
 
 
-def write_cbz(plan: FolderPlan, options: Options) -> None:
+def write_cbz(plan: FolderPlan, options: Options) -> list[ArchiveEntry]:
     plan.output.parent.mkdir(parents=True, exist_ok=True)
     entries = plan_archive_entries(plan.files, plan.source, options)
     magick = options.imagemagick
@@ -435,7 +525,18 @@ def write_cbz(plan: FolderPlan, options: Options) -> None:
     tmp_path = plan.output.with_name(plan.output.name + ".partial")
     if tmp_path.exists():
         tmp_path.unlink()
+    convert_tmpdir = None
+    converted_files: dict[str, Path] = {}
     try:
+        convert_entries = [entry for entry in entries if entry.convert]
+        if convert_entries:
+            assert magick is not None and options.convert_to is not None
+            workers = min(options.jobs, len(convert_entries))
+            if workers > 1:
+                convert_tmpdir = tempfile.TemporaryDirectory(prefix="bulk_cbz_convert_")
+                converted_files = convert_pages_to_files(
+                    convert_entries, options, magick, Path(convert_tmpdir.name)
+                )
         with zipfile.ZipFile(
             tmp_path,
             mode="w",
@@ -443,28 +544,86 @@ def write_cbz(plan: FolderPlan, options: Options) -> None:
             allowZip64=True,
         ) as archive:
             for entry in entries:
-                if entry.convert:
-                    assert magick is not None and options.convert_to is not None
-                    data = convert_image(entry.source, options.convert_to, magick)
-                    archive.writestr(entry.arcname, data)
-                else:
+                if not entry.convert:
                     archive.write(entry.source, arcname=entry.arcname)
+                elif converted_files:
+                    archive.write(converted_files[entry.arcname], arcname=entry.arcname)
+                else:
+                    assert magick is not None and options.convert_to is not None
+                    data = convert_image(
+                        entry.source,
+                        options.convert_to,
+                        magick,
+                        gate=options.convert_gate,
+                        timing=options.timing,
+                    )
+                    archive.writestr(entry.arcname, data)
         tmp_path.replace(plan.output)
     except Exception:
         if tmp_path.exists():
             tmp_path.unlink()
         raise
+    finally:
+        if convert_tmpdir is not None:
+            convert_tmpdir.cleanup()
+    return entries
 
 
-def log(message: str, options: Options, *, error: bool = False, verbose: bool = False) -> None:
+def convert_pages_to_files(
+    entries: Sequence[ArchiveEntry],
+    options: Options,
+    magick: str,
+    dest_dir: Path,
+) -> dict[str, Path]:
+    assert options.convert_to is not None
+    convert_to = options.convert_to
+    suffix = CONVERT_TARGETS[convert_to]
+    workers = min(options.jobs, len(entries))
+
+    def work(item: tuple[int, ArchiveEntry]) -> tuple[str, Path]:
+        index, entry = item
+        dest = dest_dir / f"{index:05d}{suffix}"
+        convert_image(
+            entry.source,
+            convert_to,
+            magick,
+            dest=dest,
+            gate=options.convert_gate,
+            timing=options.timing,
+        )
+        return entry.arcname, dest
+
+    converted: dict[str, Path] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(work, (index, entry)) for index, entry in enumerate(entries)]
+        for future in as_completed(futures):
+            name, dest = future.result()
+            converted[name] = dest
+    return converted
+
+
+def log(
+    message: str,
+    options: Options,
+    *,
+    error: bool = False,
+    verbose: bool = False,
+    always: bool = False,
+) -> None:
     if error:
-        print(message, file=sys.stderr)
+        with _LOG_LOCK:
+            print(message, file=sys.stderr)
+        return
+    if always:
+        with _LOG_LOCK:
+            print(message)
         return
     if options.quiet:
         return
     if verbose and not options.verbose:
         return
-    print(message)
+    with _LOG_LOCK:
+        print(message)
 
 
 def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
@@ -492,7 +651,7 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
         )
 
     try:
-        write_cbz(plan, options)
+        entries = write_cbz(plan, options)
     except Exception as exc:
         log(status_line("error", f"{display_path(plan.source, root)}: {exc}"), options, error=True)
         return PackResult(
@@ -504,7 +663,7 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
         )
 
     log(status_line("ok", f"{label} ({len(plan.files)} files)"), options)
-    for entry in plan_archive_entries(plan.files, plan.source, options):
+    for entry in entries:
         log(entry_log_line(entry), options, verbose=True)
 
     if options.delete_folders:
@@ -536,9 +695,33 @@ def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
     )
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.3f}s"
+    minutes, rest = divmod(seconds, 60)
+    hours, minutes = divmod(int(minutes), 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{rest:05.2f}s"
+    return f"{int(minutes)}m{rest:05.2f}s"
+
+
+def log_timing(options: Options) -> None:
+    timing = options.timing
+    if timing is None:
+        return
+    detail = (
+        f"discover={format_duration(timing.discover)} "
+        f"convert={format_duration(timing.convert)} "
+        f"pack={format_duration(timing.pack)} "
+        f"total={format_duration(timing.total)}"
+    )
+    log(status_line("time", detail), options, always=True)
+
+
 def summarize(results: Sequence[PackResult], options: Options) -> int:
     if not results:
         log(status_line("done", f"no packable folders found in {display_path(options.directory, options.directory)}"), options)
+        log_timing(options)
         return 0
 
     counts = {
@@ -554,13 +737,17 @@ def summarize(results: Sequence[PackResult], options: Options) -> int:
     dry_run = counts["dry-run"]
     skipped = counts["skipped"]
     failed = counts["failed"]
+    packed_files = sum(
+        result.file_count for result in results if result.status in {"created", "dry-run"}
+    )
     log(
         status_line(
             "done",
-            f"created={created} dry-run={dry_run} skipped={skipped} failed={failed}",
+            f"created={created} dry-run={dry_run} skipped={skipped} failed={failed} files={packed_files}",
         ),
         options,
     )
+    log_timing(options)
     return 1 if failed else 0
 
 
@@ -596,6 +783,9 @@ common usages:
 
   %(prog)s . --no-convert
       Pack original page files without converting formats.
+
+  %(prog)s . --jobs 4
+      Pack and convert with 4 workers.
 
   %(prog)s . --exclude '*sample*'
       Skip folders whose names match a glob.
@@ -646,6 +836,14 @@ common usages:
         "--output",
         metavar="DIR",
         help="Write CBZ files under this directory (default: next to each folder)",
+    )
+    output.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        metavar="N",
+        default=None,
+        help="Parallel workers for packing chapters and converting pages (default: CPU count, max 8)",
     )
     output.add_argument(
         "-f",
@@ -725,6 +923,8 @@ def options_from_args(args: argparse.Namespace) -> Options:
         raise BulkCbzError("use either --quiet or --verbose, not both")
     if args.no_convert and args.convert_to:
         raise BulkCbzError("use either --convert-to or --no-convert, not both")
+    if args.jobs is not None and args.jobs < 1:
+        raise BulkCbzError("--jobs must be at least 1")
 
     extra_excludes = tuple(args.exclude) if args.exclude else ()
     exclude = DEFAULT_EXCLUDES + extra_excludes
@@ -745,6 +945,7 @@ def options_from_args(args: argparse.Namespace) -> Options:
         delete_folders=args.delete_folders,
         convert_to=convert_to,
         imagemagick=args.imagemagick,
+        jobs=default_jobs() if args.jobs is None else args.jobs,
     )
 
 
@@ -771,14 +972,29 @@ def warn_and_skip_conversion(options: Options) -> None:
 
 
 def run(options: Options) -> list[PackResult]:
+    if options.timing is None:
+        options.timing = Timing()
+    timing = options.timing
+    started = time.perf_counter()
+    discover_started = time.perf_counter()
     plans = plan_conversions(options)
+    timing.discover = time.perf_counter() - discover_started
     if needs_conversion(plans, options):
         magick = find_imagemagick(options.imagemagick)
         if magick:
             options.imagemagick = magick
         else:
             warn_and_skip_conversion(options)
-    return [convert_folder(plan, options) for plan in plans]
+    options.convert_gate = threading.BoundedSemaphore(max(1, options.jobs))
+    pack_started = time.perf_counter()
+    if options.jobs <= 1 or options.dry_run or len(plans) <= 1:
+        results = [convert_folder(plan, options) for plan in plans]
+    else:
+        with ThreadPoolExecutor(max_workers=options.jobs) as pool:
+            results = list(pool.map(lambda plan: convert_folder(plan, options), plans))
+    timing.pack = time.perf_counter() - pack_started
+    timing.total = time.perf_counter() - started
+    return results
 
 
 def main(argv: Sequence[str] | None = None) -> int:

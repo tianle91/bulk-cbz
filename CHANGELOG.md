@@ -5,7 +5,13 @@ script version is the `__version__` string in `bulk_cbz.py` (`python3 bulk_cbz.p
 
 ## [1.2.0] - Unreleased
 
-Leaf-chapter packing and quieter logs.
+Leaf-chapter packing, quieter logs, and faster packing.
+
+### Added
+
+- `-j`, `--jobs N` to set the worker count. Use `--jobs 1` on a spinning disk or network share if parallel I/O hurts.
+- `benchmarks/bench.py` times discovery, packing, conversion, and `os.walk` / `os.scandir` / `find` listing on a synthetic library. Reports throughput and optional `--repeat` mean ± stdev, plus the script's own `time` line.
+- A `time` summary on every run: discover, convert, pack, and total wall-clock. Printed even with `--quiet`.
 
 ### Changed
 
@@ -17,6 +23,13 @@ Leaf-chapter packing and quieter logs.
 - ZIP entries are always stored uncompressed.
 - Status logs print a path relative to the scan root once (`Author/Series/Chapter.cbz`) instead of repeating long source and output directories. Verbose mode lists page filenames only.
 - CLI flags are grouped into discovery, output, images, and logging.
+- Discovery finds leaf chapters by walking ancestors (`O(n × depth)`), so names that share a natural-sort key cannot hide a descendant.
+- Chapters are packed in parallel. ImageMagick conversions share the same `--jobs` budget across chapters and pages (a semaphore caps concurrent magick processes) and spill to temporary files so a whole chapter is not held in RAM.
+
+### Fixed
+
+- `Chapter 1` next to `Chapter 01` no longer packs the parent folder when `Chapter 1/pages` is the real leaf.
+- Parallel conversion no longer accumulates every encoded page in memory before writing the ZIP.
 
 ### Removed
 
