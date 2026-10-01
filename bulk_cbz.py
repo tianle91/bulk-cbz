@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""Convert each folder in a directory into a CBZ comic archive.
+
+A CBZ file is a ZIP archive of page images. This script walks a parent
+directory (the current working directory by default) and packs every
+child folder into ``FolderName.cbz``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import os
+import re
+import shutil
+import sys
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Iterable, Sequence
+
+__version__ = "1.0.0"
+
+IMAGE_EXTENSIONS = {
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".jpeg",
+    ".jpg",
+    ".jxl",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
+METADATA_NAMES = {"comicinfo.xml"}
+DEFAULT_EXCLUDES = ("__MACOSX", "@eaDir")
+PARTIAL_SUFFIX = ".cbz.partial"
+
+_NATURAL_SPLIT = re.compile(r"(\d+)")
+
+
+class BulkCbzError(Exception):
+    """Raised for usage problems that should exit with a clear message."""
+
+
+@dataclass
+class Options:
+    directory: Path
+    output: Path | None = None
+    dry_run: bool = False
+    verbose: bool = False
+    quiet: bool = False
+    overwrite: bool = False
+    recursive: bool = False
+    leaves_only: bool = False
+    include_nested: bool = False
+    all_files: bool = False
+    include_hidden: bool = False
+    follow_symlinks: bool = False
+    extra_extensions: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = DEFAULT_EXCLUDES
+    min_files: int = 1
+    compression: str = "store"
+    delete_folders: bool = False
+
+
+@dataclass
+class FolderPlan:
+    source: Path
+    output: Path
+    files: list[Path]
+
+
+@dataclass
+class PackResult:
+    source: Path
+    output: Path
+    status: str
+    file_count: int = 0
+    error: str | None = None
+
+
+def natural_key(value: str) -> list[tuple[int, object]]:
+    """Sort key so page2 comes before page10.
+
+    Numbers and text are tagged so Python 3 never compares ``int`` to ``str``.
+    """
+    key: list[tuple[int, object]] = []
+    for part in _NATURAL_SPLIT.split(value):
+        if not part:
+            continue
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part.casefold()))
+    return key
+
+
+def natural_path_key(path: Path) -> list[tuple[int, object]]:
+    key: list[tuple[int, object]] = []
+    for part in path.parts:
+        key.extend(natural_key(part))
+        key.append((2, ""))
+    return key
+
+
+def normalize_extension(ext: str) -> str:
+    ext = ext.strip().lower()
+    if not ext:
+        raise BulkCbzError("extensions cannot be empty")
+    return ext if ext.startswith(".") else f".{ext}"
+
+
+def parse_extensions(values: Sequence[str] | None) -> tuple[str, ...]:
+    if not values:
+        return ()
+    extensions: list[str] = []
+    for value in values:
+        for piece in value.split(","):
+            if piece.strip():
+                extensions.append(normalize_extension(piece))
+    return tuple(extensions)
+
+
+def is_hidden(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = Path(path.name)
+    return any(part.startswith(".") for part in relative.parts)
+
+
+def matches_exclude(name: str, patterns: Sequence[str]) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+
+
+def zip_compression(name: str) -> int:
+    if name == "store":
+        return zipfile.ZIP_STORED
+    if name == "deflate":
+        return zipfile.ZIP_DEFLATED
+    raise BulkCbzError(f"unknown compression mode: {name}")
+
+
+def is_packable_file(path: Path, options: Options) -> bool:
+    if not path.is_file():
+        return False
+    if path.is_symlink() and not options.follow_symlinks:
+        return False
+    if not options.include_hidden and path.name.startswith("."):
+        return False
+    if options.all_files:
+        return path.suffix.lower() != ".cbz" and not path.name.endswith(PARTIAL_SUFFIX)
+    suffix = path.suffix.lower()
+    extra = {normalize_extension(ext) for ext in options.extra_extensions}
+    if suffix in IMAGE_EXTENSIONS or suffix in extra:
+        return True
+    return path.name.casefold() in METADATA_NAMES
+
+
+def iter_candidate_files(folder: Path, options: Options) -> Iterable[Path]:
+    if options.include_nested:
+        walker = os.walk(
+            folder,
+            followlinks=options.follow_symlinks,
+            topdown=True,
+        )
+        for dirpath, dirnames, filenames in walker:
+            current = Path(dirpath)
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not matches_exclude(name, options.exclude)
+                and (options.include_hidden or not name.startswith("."))
+            ]
+            dirnames.sort(key=natural_key)
+            for name in filenames:
+                path = current / name
+                if is_packable_file(path, options):
+                    yield path
+        return
+
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return
+    for path in entries:
+        if is_packable_file(path, options):
+            yield path
+
+
+def collect_files(folder: Path, options: Options) -> list[Path]:
+    files = list(iter_candidate_files(folder, options))
+    files.sort(key=lambda path: natural_path_key(path.relative_to(folder)))
+    return files
+
+
+def should_skip_dir(path: Path, root: Path, options: Options) -> bool:
+    if path == root:
+        return True
+    if matches_exclude(path.name, options.exclude):
+        return True
+    if not options.include_hidden and is_hidden(path, root):
+        return True
+    if not options.follow_symlinks and path.is_symlink():
+        return True
+    if options.output is not None and path == options.output:
+        return True
+    return False
+
+
+def discover_folders(root: Path, options: Options) -> list[Path]:
+    if not options.recursive:
+        folders: list[Path] = []
+        try:
+            entries = list(root.iterdir())
+        except OSError as exc:
+            raise BulkCbzError(f"cannot read {root}: {exc}") from exc
+        for path in sorted(entries, key=lambda item: natural_key(item.name)):
+            if path.is_dir() and not should_skip_dir(path, root, options):
+                folders.append(path)
+        return folders
+
+    found: list[Path] = []
+    for dirpath, dirnames, _filenames in os.walk(
+        root,
+        followlinks=options.follow_symlinks,
+        topdown=True,
+    ):
+        current = Path(dirpath)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not should_skip_dir(current / name, root, options)
+        ]
+        dirnames.sort(key=natural_key)
+        if current == root:
+            continue
+        if collect_files(current, options):
+            found.append(current)
+    found.sort(key=natural_path_key)
+    return found
+
+
+def is_leaf_folder(folder: Path, folders: Sequence[Path]) -> bool:
+    folder_str = str(folder)
+    prefix = folder_str + os.sep
+    return not any(str(other).startswith(prefix) for other in folders if other != folder)
+
+
+def output_path_for(folder: Path, root: Path, options: Options) -> Path:
+    if options.output is None:
+        return folder.parent / f"{folder.name}.cbz"
+    relative = folder.relative_to(root)
+    return options.output / relative.parent / f"{relative.name}.cbz"
+
+
+def plan_conversions(options: Options) -> list[FolderPlan]:
+    root = options.directory
+    folders = discover_folders(root, options)
+    if options.leaves_only:
+        folders = [folder for folder in folders if is_leaf_folder(folder, folders)]
+
+    plans: list[FolderPlan] = []
+    for folder in folders:
+        files = collect_files(folder, options)
+        if len(files) < options.min_files:
+            continue
+        plans.append(
+            FolderPlan(
+                source=folder,
+                output=output_path_for(folder, root, options),
+                files=files,
+            )
+        )
+    return plans
+
+
+def arcname_for(file: Path, folder: Path) -> str:
+    return PurePosixPath(file.relative_to(folder).as_posix()).as_posix()
+
+
+def unique_arcnames(files: Sequence[Path], folder: Path) -> list[tuple[Path, str]]:
+    used: dict[str, Path] = {}
+    mapping: list[tuple[Path, str]] = []
+    for file in files:
+        name = arcname_for(file, folder)
+        previous = used.get(name.casefold())
+        if previous is not None:
+            raise BulkCbzError(
+                f"duplicate archive path {name!r} from {previous} and {file}"
+            )
+        used[name.casefold()] = file
+        mapping.append((file, name))
+    return mapping
+
+
+def write_cbz(plan: FolderPlan, options: Options) -> None:
+    plan.output.parent.mkdir(parents=True, exist_ok=True)
+    entries = unique_arcnames(plan.files, plan.source)
+    tmp_path = plan.output.with_name(plan.output.name + ".partial")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    try:
+        with zipfile.ZipFile(
+            tmp_path,
+            mode="w",
+            compression=zip_compression(options.compression),
+            allowZip64=True,
+        ) as archive:
+            for file, name in entries:
+                archive.write(file, arcname=name)
+        tmp_path.replace(plan.output)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def log(message: str, options: Options, *, error: bool = False, verbose: bool = False) -> None:
+    if error:
+        print(message, file=sys.stderr)
+        return
+    if options.quiet:
+        return
+    if verbose and not options.verbose:
+        return
+    print(message)
+
+
+def convert_folder(plan: FolderPlan, options: Options) -> PackResult:
+    if plan.output.exists() and not options.overwrite:
+        log(
+            f"skip  {plan.source.name}: {plan.output} already exists",
+            options,
+        )
+        return PackResult(
+            source=plan.source,
+            output=plan.output,
+            status="skipped",
+            file_count=len(plan.files),
+        )
+
+    if options.dry_run:
+        log(
+            f"dry   {plan.source} -> {plan.output} ({len(plan.files)} files)",
+            options,
+        )
+        for file in plan.files:
+            log(f"        {file.relative_to(plan.source)}", options, verbose=True)
+        return PackResult(
+            source=plan.source,
+            output=plan.output,
+            status="dry-run",
+            file_count=len(plan.files),
+        )
+
+    try:
+        write_cbz(plan, options)
+    except Exception as exc:
+        log(f"error {plan.source}: {exc}", options, error=True)
+        return PackResult(
+            source=plan.source,
+            output=plan.output,
+            status="failed",
+            file_count=len(plan.files),
+            error=str(exc),
+        )
+
+    log(
+        f"ok    {plan.source} -> {plan.output} ({len(plan.files)} files)",
+        options,
+    )
+    for file in plan.files:
+        log(f"        {file.relative_to(plan.source)}", options, verbose=True)
+
+    if options.delete_folders:
+        try:
+            shutil.rmtree(plan.source)
+            log(f"rm    {plan.source}", options)
+        except OSError as exc:
+            log(
+                f"error {plan.source}: packed, but failed to delete folder: {exc}",
+                options,
+                error=True,
+            )
+            return PackResult(
+                source=plan.source,
+                output=plan.output,
+                status="failed",
+                file_count=len(plan.files),
+                error=f"packed, but failed to delete folder: {exc}",
+            )
+
+    return PackResult(
+        source=plan.source,
+        output=plan.output,
+        status="created",
+        file_count=len(plan.files),
+    )
+
+
+def summarize(results: Sequence[PackResult], options: Options) -> int:
+    if not results:
+        log(f"done  no packable folders found in {options.directory}", options)
+        return 0
+
+    counts = {
+        "created": 0,
+        "dry-run": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+    for result in results:
+        counts[result.status] = counts.get(result.status, 0) + 1
+
+    created = counts["created"]
+    dry_run = counts["dry-run"]
+    skipped = counts["skipped"]
+    failed = counts["failed"]
+    log(
+        f"done  created={created} dry-run={dry_run} skipped={skipped} failed={failed}",
+        options,
+    )
+    return 1 if failed else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="bulk_cbz.py",
+        description=(
+            "Convert every folder in a directory into a CBZ file named after "
+            "that folder. Image pages are added in natural order "
+            "(page2 before page10)."
+        ),
+        epilog="""
+common usages:
+  %(prog)s
+      Pack each folder in the current directory into FolderName.cbz.
+
+  %(prog)s ~/Comics/One-Piece
+      Pack every volume/chapter folder in a series directory.
+
+  %(prog)s . --dry-run --verbose
+      Preview archives and the page files they would contain.
+
+  %(prog)s ./chapters --output ./cbz
+      Write CBZ files somewhere else and leave the source folders alone.
+
+  %(prog)s ./library --recursive --leaves-only
+      Walk a nested library and only pack the lowest image folders
+      (chapters), not series folders that also have a cover image.
+
+  %(prog)s ./volume --include-nested
+      A chapter folder whose pages live in a subfolder still becomes one CBZ.
+
+  %(prog)s . --overwrite --delete-folders
+      Replace existing archives, then delete folders after a successful pack.
+
+  %(prog)s . --min-files 10 --exclude '*sample*'
+      Skip incomplete chapters and folders whose names match a glob.
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="Parent directory whose folders become CBZ files (default: current directory)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="DIR",
+        help="Write CBZ files under this directory (default: next to each folder)",
+    )
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="Show what would be created without writing or deleting files",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print every file added to an archive",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Only print errors",
+    )
+    parser.add_argument(
+        "-f",
+        "--overwrite",
+        action="store_true",
+        help="Replace existing CBZ files (default: skip them)",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="Convert folders at every nesting level, not just immediate children",
+    )
+    parser.add_argument(
+        "--leaves-only",
+        action="store_true",
+        help="With --recursive, skip folders that contain other packable folders",
+    )
+    parser.add_argument(
+        "--include-nested",
+        action="store_true",
+        help="Include images from subfolders of each packed folder",
+    )
+    parser.add_argument(
+        "--all-files",
+        action="store_true",
+        help="Pack every file except other CBZ archives, not just images and ComicInfo.xml",
+    )
+    parser.add_argument(
+        "--include-hidden",
+        action="store_true",
+        help="Include hidden files and folders (names starting with a dot)",
+    )
+    parser.add_argument(
+        "--follow-symlinks",
+        action="store_true",
+        help="Follow symbolic links when scanning folders and files",
+    )
+    parser.add_argument(
+        "--ext",
+        action="append",
+        dest="ext",
+        metavar="EXT",
+        help="Additional image extension to pack (repeatable or comma-separated)",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        dest="exclude",
+        metavar="GLOB",
+        help="Skip folder names matching this glob (repeatable; default: __MACOSX, @eaDir)",
+    )
+    parser.add_argument(
+        "--min-files",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Skip folders with fewer than N packable files (default: 1)",
+    )
+    parser.add_argument(
+        "--compression",
+        choices=("store", "deflate"),
+        default="store",
+        help="ZIP compression. store is faster and typical for already-compressed images",
+    )
+    parser.add_argument(
+        "--delete-folders",
+        action="store_true",
+        help="Delete each source folder after it is packed successfully",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def options_from_args(args: argparse.Namespace) -> Options:
+    directory = Path(args.directory).expanduser().resolve()
+    if not directory.exists():
+        raise BulkCbzError(f"directory does not exist: {directory}")
+    if not directory.is_dir():
+        raise BulkCbzError(f"not a directory: {directory}")
+
+    output = Path(args.output).expanduser().resolve() if args.output else None
+    if output is not None and output.exists() and not output.is_dir():
+        raise BulkCbzError(f"output path is not a directory: {output}")
+
+    if args.min_files < 1:
+        raise BulkCbzError("--min-files must be at least 1")
+    if args.leaves_only and not args.recursive:
+        raise BulkCbzError("--leaves-only requires --recursive")
+    if args.quiet and args.verbose:
+        raise BulkCbzError("use either --quiet or --verbose, not both")
+
+    extra_excludes = tuple(args.exclude) if args.exclude else ()
+    exclude = DEFAULT_EXCLUDES + extra_excludes
+    return Options(
+        directory=directory,
+        output=output,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+        quiet=args.quiet,
+        overwrite=args.overwrite,
+        recursive=args.recursive,
+        leaves_only=args.leaves_only,
+        include_nested=args.include_nested,
+        all_files=args.all_files,
+        include_hidden=args.include_hidden,
+        follow_symlinks=args.follow_symlinks,
+        extra_extensions=parse_extensions(args.ext),
+        exclude=exclude,
+        min_files=args.min_files,
+        compression=args.compression,
+        delete_folders=args.delete_folders,
+    )
+
+
+def run(options: Options) -> list[PackResult]:
+    return [convert_folder(plan, options) for plan in plan_conversions(options)]
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        options = options_from_args(args)
+        results = run(options)
+    except BulkCbzError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return summarize(results, options)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
