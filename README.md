@@ -8,7 +8,10 @@ A CBZ is a ZIP archive of comic pages. Point the script at a parent folder
 (or run it in the current directory) and each child folder becomes
 `FolderName.cbz`.
 
-Requires Python 3.9+ and the standard library only.
+Requires Python 3.9+ and the standard library. If
+[ImageMagick](https://imagemagick.org/) (`magick` or `convert`) is on your PATH,
+pages that are not JPEG or PNG are converted to PNG by default. If it is not
+available, the script warns and packs the original files.
 
 ```bash
 python3 bulk_cbz.py --help
@@ -65,12 +68,25 @@ Skip thin chapters and names you do not want packed:
 python3 bulk_cbz.py . --min-files 10 --exclude '*sample*'
 ```
 
+Convert WebP/GIF/etc. to JPEG instead of PNG (JPEG and PNG pages stay as-is):
+
+```bash
+python3 bulk_cbz.py . --convert-to jpeg
+```
+
+Pack original page files without ImageMagick:
+
+```bash
+python3 bulk_cbz.py . --no-convert
+```
+
 ## What gets packed
 
 By default the script:
 
 - Converts **immediate subfolders** of the given directory, not the directory itself
 - Adds image pages (`jpg`, `jpeg`, `png`, `gif`, `webp`, `bmp`, `tif`, `tiff`, `avif`, `jxl`, `heic`) plus `ComicInfo.xml`
+- Leaves JPEG and PNG pages as-is, and converts other page formats to PNG with ImageMagick when it is available (alpha is kept; use `--convert-to` or `--no-convert` to change that). If ImageMagick is missing, the script warns and packs the originals
 - Sorts pages naturally, so `page2` comes before `page10`
 - Stores files uncompressed (`--compression store`), which is typical for already-compressed images
 - Skips existing CBZ files unless `--overwrite` is set
@@ -94,6 +110,9 @@ By default the script:
 | `--ext EXT` | Also pack this image extension (repeatable or comma-separated) |
 | `--exclude GLOB` | Skip matching folder names (repeatable) |
 | `--min-files N` | Skip folders with fewer than N packable files |
+| `--convert-to {png,jpeg,jpg,webp}` | Format for pages that are not JPEG or PNG (default: png) |
+| `--no-convert` | Pack original page files without converting formats |
+| `--imagemagick CMD` | ImageMagick executable to use |
 | `--compression {store,deflate}` | ZIP compression method |
 | `--delete-folders` | Remove each source folder after it is packed |
 
@@ -104,3 +123,4 @@ python3 -m unittest discover -s tests -v
 ```
 
 GitHub Actions runs that suite on every pull request across Python 3.9–3.13.
+Conversion tests are skipped when ImageMagick is not installed.

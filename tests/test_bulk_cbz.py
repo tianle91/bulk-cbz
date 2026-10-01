@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 import sys
 import unittest
 import zipfile
@@ -14,6 +15,9 @@ sys.path.insert(0, str(ROOT))
 
 import bulk_cbz  # noqa: E402
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SOI = b"\xff\xd8"
+
 
 def write_file(path: Path, content: bytes = b"page") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -24,6 +28,39 @@ def write_file(path: Path, content: bytes = b"page") -> Path:
 def zip_names(path: Path) -> list[str]:
     with zipfile.ZipFile(path) as archive:
         return archive.namelist()
+
+
+def zip_bytes(path: Path, name: str) -> bytes:
+    with zipfile.ZipFile(path) as archive:
+        return archive.read(name)
+
+
+def png_color_type(data: bytes) -> int:
+    if not data.startswith(PNG_SIGNATURE):
+        raise AssertionError("not a PNG")
+    return data[25]
+
+
+def require_imagemagick() -> str:
+    found = bulk_cbz.find_imagemagick()
+    if not found:
+        raise unittest.SkipTest("ImageMagick is not available")
+    return found
+
+
+def write_im_image(path: Path, im_format: str, *, transparent: bool = False) -> Path:
+    magick = require_imagemagick()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    args = [magick, "-size", "4x4"]
+    if transparent:
+        args.extend(["xc:none", "-fill", "rgba(255,0,0,0.5)", "-draw", "point 1,1"])
+    else:
+        args.extend(["xc:red"])
+    args.append(f"{im_format}:{path}")
+    proc = subprocess.run(args, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode("utf-8", errors="replace"))
+    return path
 
 
 def run_cli(args: list[str]) -> tuple[int, str, str]:
@@ -58,7 +95,7 @@ class BulkCbzTests(unittest.TestCase):
             write_file(tenth / "01.webp")
             write_file(series / "cover.jpg")
 
-            code, stdout, stderr = run_cli([str(series)])
+            code, stdout, stderr = run_cli([str(series), "--no-convert"])
 
             self.assertEqual(code, 0, stderr)
             self.assertTrue((series / "Vol 1.cbz").is_file())
@@ -66,6 +103,7 @@ class BulkCbzTests(unittest.TestCase):
             self.assertTrue((series / "Vol 10.cbz").is_file())
             self.assertFalse((series / "library.cbz").exists())
             self.assertEqual(zip_names(series / "Vol 1.cbz"), ["1.jpg", "2.jpg", "10.jpg", "ComicInfo.xml"])
+            self.assertEqual(zip_names(series / "Vol 10.cbz"), ["01.webp"])
             self.assertIn("created=3", stdout)
 
     def test_dry_run_does_not_write_files(self) -> None:
@@ -220,6 +258,75 @@ class BulkCbzTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("common usages", stdout)
         self.assertIn("--dry-run", stdout)
+        self.assertIn("--convert-to", stdout)
+
+    def test_no_convert_and_convert_to_are_exclusive(self) -> None:
+        code, _stdout, stderr = run_cli([".", "--no-convert", "--convert-to", "jpeg"])
+        self.assertEqual(code, 2)
+        self.assertIn("use either --convert-to or --no-convert", stderr)
+
+    def test_webp_converts_to_png_and_keeps_transparency(self) -> None:
+        require_imagemagick()
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            folder = root / "Ch"
+            write_im_image(folder / "page.webp", "WEBP", transparent=True)
+            write_file(folder / "keep.jpg", b"jpeg-bytes")
+            write_file(folder / "keep.png", b"png-bytes")
+
+            code, stdout, stderr = run_cli([str(root), "--verbose"])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(zip_names(root / "Ch.cbz"), ["keep.jpg", "keep.png", "page.png"])
+            self.assertIn("page.webp -> page.png", stdout)
+            self.assertEqual(zip_bytes(root / "Ch.cbz", "keep.jpg"), b"jpeg-bytes")
+            self.assertEqual(zip_bytes(root / "Ch.cbz", "keep.png"), b"png-bytes")
+            converted = zip_bytes(root / "Ch.cbz", "page.png")
+            self.assertTrue(converted.startswith(PNG_SIGNATURE))
+            self.assertEqual(png_color_type(converted), 6)
+
+    def test_convert_to_jpeg_flattens_transparency(self) -> None:
+        require_imagemagick()
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            folder = root / "Ch"
+            write_im_image(folder / "page.webp", "WEBP", transparent=True)
+            write_file(folder / "keep.png", b"png-bytes")
+
+            code, _stdout, stderr = run_cli([str(root), "--convert-to", "jpeg"])
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(zip_names(root / "Ch.cbz"), ["keep.png", "page.jpg"])
+            self.assertEqual(zip_bytes(root / "Ch.cbz", "keep.png"), b"png-bytes")
+            converted = zip_bytes(root / "Ch.cbz", "page.jpg")
+            self.assertTrue(converted.startswith(JPEG_SOI))
+
+    def test_dry_run_skips_conversion_when_imagemagick_missing(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            folder = root / "Ch"
+            write_file(folder / "page.webp")
+
+            code, stdout, stderr = run_cli(
+                [str(root), "--dry-run", "--verbose", "--imagemagick", "/missing/magick"]
+            )
+            self.assertEqual(code, 0)
+            self.assertFalse((root / "Ch.cbz").exists())
+            self.assertIn("ImageMagick", stderr)
+            self.assertIn("without conversion", stderr)
+            self.assertIn("page.webp", stdout)
+            self.assertNotIn("page.webp -> page.png", stdout)
+
+    def test_missing_imagemagick_warns_and_packs_originals(self) -> None:
+        with TemporaryDirectory() as raw:
+            root = Path(raw)
+            write_file(root / "Ch" / "page.webp", b"webp-bytes")
+            code, _stdout, stderr = run_cli(
+                [str(root), "--imagemagick", "/missing/magick"]
+            )
+            self.assertEqual(code, 0, stderr)
+            self.assertIn("ImageMagick", stderr)
+            self.assertIn("without conversion", stderr)
+            self.assertEqual(zip_names(root / "Ch.cbz"), ["page.webp"])
+            self.assertEqual(zip_bytes(root / "Ch.cbz", "page.webp"), b"webp-bytes")
 
 
 if __name__ == "__main__":
